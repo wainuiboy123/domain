@@ -1,7 +1,5 @@
-local plrs = game.Players
-local plr = plrs.LocalPlayer
-local plrui = plr.PlayerGui
+local player = game.Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
 
-local sui = Instance.new("ScreenGui")
-sui.Parent = plrui
-sui.Name = "TestSuccess"
+local screenGui = Instance.new("ScreenGui", playerGui)
+screenGui.Name = "TestSuccess"
