@@ -1,5 +1,5 @@
 local mon = peripheral.find("monitor")
-
+local cb = peripheral.find("chat_box")
 if not mon then
     error("No monitor found")
 end
@@ -8,7 +8,7 @@ mon.setTextScale(1)
 
 -- button data
 local button = {
-    name = "DUMP",
+    name = "test",
     xmin = 2,
     xmax = 12,
     ymin = 3,
@@ -30,24 +30,13 @@ local function drawButton()
     -- center text
     mon.setCursorPos(4, 4)
     mon.setTextColor(colors.white)
-    mon.write("DUMP")
+    mon.write("test")
 
     mon.setBackgroundColor(colors.black)
 end
 
 local function onClick()
-    print("Button clicked!")
-
-    -- YOUR ACTION HERE
-    local im = peripheral.find("inventory_manager")
-    if im then
-        local items = im.getItems()
-        for _, item in pairs(items) do
-            if item.slot >= 9 and item.slot <= 26 then
-                im.removeItemFromPlayer(item, item.count)
-            end
-        end
-    end
+    cb.sendMessage("test")
 end
 
 drawButton()
