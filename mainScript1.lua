@@ -59,9 +59,9 @@ end
 
 -- ── Peripherals ──────────────────────────────────────────────
 local detector  = peripheral.find("player_detector")
-local chatBox   = peripheral.find("chatBox")
+local chatBox   = peripheral.find("chat_box")
 local mon       = peripheral.find("monitor")
-local chest     = peripheral.find("inventory")  -- any inventory peripheral
+local chest     = peripheral.find("inventory_manager")  -- any inventory peripheral
 
 if not detector  then error("No player_detector found!", 0) end
 if not chatBox   then error("No chatBox found!", 0) end
