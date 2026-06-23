@@ -57,7 +57,7 @@ local function drawUI()
     -- FRAME FIRST
     drawFrame(1, 1, 51, 3, colors.LightGray)
     drawButton()
-    drawText(1, 1, colors.white
+    drawText(1, 1, colors.white)
     
 end
 
