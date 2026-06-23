@@ -65,7 +65,7 @@ local THEME = {
     colHeadFg   = colors.lightGray,
     panelBg     = colors.gray,
     promote     = colors.green,
-    demote      = colors.pink,      -- "light red"
+    demote      = colors.orange,    -- demote button color
     blacklist   = colors.red,       -- dark red equivalent (red is the darkest stock red)
     btnTextOn   = colors.white,
     btnDisabled = colors.gray,
@@ -178,16 +178,18 @@ end
 local function fillRect(text, bg, fg, xmin, xmax, ymin, ymax)
     mon.setBackgroundColor(bg)
     mon.setTextColor(fg or colors.white)
+    local width = xmax - xmin + 1
     local yspot = math.floor((ymin + ymax) / 2)
-    local xspot = math.floor((xmax - xmin - #text) / 2)
+    local leftPad = math.floor((width - #text) / 2)
+    local rightPad = width - #text - leftPad
     for y = ymin, ymax do
         mon.setCursorPos(xmin, y)
         if y == yspot then
-            mon.write(string.rep(" ", xspot))
+            mon.write(string.rep(" ", math.max(0, leftPad)))
             mon.write(text)
-            mon.write(string.rep(" ", math.max(0, xmax - xmin + 1 - xspot - #text)))
+            mon.write(string.rep(" ", math.max(0, rightPad)))
         else
-            mon.write(string.rep(" ", xmax - xmin + 1))
+            mon.write(string.rep(" ", width))
         end
     end
 end
@@ -196,11 +198,16 @@ end
 
 local function refreshPlayerList()
     local online = detector.getOnlinePlayers()
-    table.sort(online)
     players = {}
     for _, name in ipairs(online) do
         table.insert(players, { name = name, rank = getRank(name) })
     end
+    table.sort(players, function(a, b)
+        if a.rank ~= b.rank then
+            return a.rank > b.rank  -- highest rank first
+        end
+        return a.name < b.name      -- alphabetical tie-breaker
+    end)
     rowsVisible = listEndY - listStartY + 1
     if scrollOffset > math.max(0, #players - rowsVisible) then
         scrollOffset = math.max(0, #players - rowsVisible)
@@ -319,7 +326,7 @@ local function drawActionButtons()
 
     -- PROMOTE
     fillRect(
-        hasSelection and "PROMOTE" or "PROMOTE",
+        "PROMOTE",
         hasSelection and THEME.promote or THEME.btnDisabled,
         colors.white, x1min, x1max, btnTop, btnBottom
     )
