@@ -51,7 +51,7 @@ end
 local function onClick()
     cb.sendMessage("test")
 end
-drawFrame(0,0,10,1,colors.gray)
+drawFrame(1, 1, 51, 3, colors.gray)
 drawButton()
 
 while true do
