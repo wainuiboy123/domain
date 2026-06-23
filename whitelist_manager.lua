@@ -3,7 +3,17 @@ local cb = peripheral.find("chat_box")
 
 if not mon then error("No monitor found") end
 
-mon.setTextScale(1)
+mon.setTextScale(0.5)
+local function clearScreen(bg)
+    mon.setBackgroundColor(bg or colors.black)
+    mon.clear()
+end
+
+local function drawText(x, y, text, color)
+    mon.setTextColor(color or colors.white)
+    mon.setCursorPos(x, y)
+    mon.write(text)
+end
 
 local function drawFrame(x1, y1, x2, y2, color)
     mon.setBackgroundColor(color or colors.gray)
@@ -44,16 +54,14 @@ local function drawButton()
 end
 
 local function drawUI()
-    mon.clear()
-
     -- FRAME FIRST
-    drawFrame(1, 1, 51, 3, colors.gray)
-
-    -- BUTTON SECOND
+    drawFrame(1, 1, 51, 3, colors.LightGray)
     drawButton()
+    drawText(1, 1, colors.white
+    
 end
 
-local function onClick()
+local function onClickTest()
     cb.sendMessage("test")
 end
 
@@ -65,6 +73,6 @@ while true do
     if x >= button.xmin and x <= button.xmax and y >= button.ymin and y <= button.ymax then
         button.active = not button.active
         drawUI()
-        onClick()
+        onClickTest()
     end
 end
