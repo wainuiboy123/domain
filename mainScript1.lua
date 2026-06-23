@@ -1,24 +1,27 @@
-local inv = peripheral.find("inventory_manager")
+local im = peripheral.find("inventory_manager")
+local cb = peripheral.find("chat_box")
 
-if not inv then
-    error("inventory_manager not found")
-end
+if not im then error("inventory manager not found") end
+if not cb then error("chat_box not found") end
 
--- get linked player inventory (THIS is the correct function in your build
-local items = inv.getInventory()
+print("Running dumper")
 
-if not items then
-    error("No items found / memory card not linked")
-end
+while true do
+    local e, username, msg = os.pullEvent("chat")
 
-print("Transferring items...")
+    if msg == "dump" and username == "toastonrye" then
+        print("Dumping inventory slots 9-26")
 
-for _, item in pairs(items) do
-    if item and item.count and item.slot then
-        pcall(function()
-            inv.removeItemFromPlayer(item, item.count)
-        end)
+        local items = im.getItems()
+
+        for _, item in pairs(items) do
+            if item.slot >= 9 and item.slot <= 26 then
+                pcall(function()
+                    im.removeItemFromPlayer(item, item.count)
+                end)
+            end
+        end
+
+        print("Done")
     end
 end
-
-print("Done!")
