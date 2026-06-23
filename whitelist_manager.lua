@@ -6,6 +6,19 @@ end
 
 mon.setTextScale(1)
 
+
+local function drawFrame(x1, y1, x2, y2, color)
+    mon.setBackgroundColor(color or colors.gray)
+
+    for y = y1, y2 do
+        mon.setCursorPos(x1, y)
+        mon.write(string.rep(" ", x2 - x1 + 1))
+    end
+
+    mon.setBackgroundColor(colors.black)
+end
+
+
 -- button data
 local button = {
     name = "test",
@@ -38,7 +51,7 @@ end
 local function onClick()
     cb.sendMessage("test")
 end
-
+drawFrame(0,0,10,1,colors.gray)
 drawButton()
 
 while true do
