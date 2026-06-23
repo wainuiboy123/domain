@@ -15,8 +15,8 @@
 --    3. Run:  lua player_tracker.lua
 -- ============================================================
 
-local WEBHOOK_URL     = "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
-local UPDATE_INTERVAL = 5
+local WEBHOOK_URL     = "https://discord.com/api/webhooks/1518852807694880818/tJ4d23Ba01Mc1ZekjK5yhSiLykKoKofQ2EFskPzR2rT15U8nPDhYLTNUfLm5u6a2othY"
+local UPDATE_INTERVAL = 0
 local BOT_USERNAME    = "Player Tracker"
 local ID_FILE         = "tracker_message_id.txt"  -- saved locally so you don't have to set it manually
 
