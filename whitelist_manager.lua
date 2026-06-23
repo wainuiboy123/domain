@@ -1,5 +1,5 @@
 local mon = peripheral.find("monitor")
-local cb = peripheral.find("chat_box")
+local pd = peripheral.find("player_detector")
 
 if not mon then error("No monitor found") end
 
@@ -55,14 +55,17 @@ end
 
 local function drawUI()
     -- FRAME FIRST
-    drawFrame(1, 1, 51, 3, colors.LightGray)
+    --drawFrame(1, 1, 51, 3, colors.LightGray)
     drawButton()
-    drawText(1, 1, colors.white)
+    drawText(1, 1, "Whitelist Manager", colors.white)
+    for i, v in getOnlinePlayers() do
+        drawText(1, 1, i, colors.white)
+    end
     
 end
 
 local function onClickTest()
-    cb.sendMessage("test")
+    
 end
 
 drawUI()
