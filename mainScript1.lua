@@ -4,26 +4,20 @@ if not inv then
     error("inventory_manager not found")
 end
 
--- get all items from the bound player (memory card must already be inserted
-local items = inv.getPlayerItems()
+-- get linked player inventory (THIS is the correct function in your build)
+local items = inv.getInventory()
 
 if not items then
-    error("No player linked / memory card not set correctly")
+    error("No items found / memory card not linked")
 end
 
-print("Moving items...")
+print("Transferring items...")
 
 for _, item in pairs(items) do
-    -- item includes: name, count, slot, etc.
-    local ok, err = pcall(function()
-        inv.removeItemFromPlayer(
-            item,      -- IMPORTANT: pass full item table, not slot number
-            item.count
-        )
-    end)
-
-    if not ok then
-        print("Failed removing:", err)
+    if item and item.count and item.slot then
+        pcall(function()
+            inv.removeItemFromPlayer(item, item.count)
+        end)
     end
 end
 
