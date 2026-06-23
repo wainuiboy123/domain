@@ -11,7 +11,7 @@
 -- ============================================================
 
 local WEBHOOK_URL     = "https://discord.com/api/webhooks/1518852807694880818/tJ4d23Ba01Mc1ZekjK5yhSiLykKoKofQ2EFskPzR2rT15U8nPDhYLTNUfLm5u6a2othY"
-local UPDATE_INTERVAL = 5   -- seconds between each edit
+local UPDATE_INTERVAL = 0.5   -- seconds between each edit
 local BOT_USERNAME    = "Player Tracker"
 
 -- ── Locate the player detector peripheral ───────────────────
