@@ -4,7 +4,7 @@ if not inv then
     error("inventory_manager not found")
 end
 
--- get linked player inventory (THIS is the correct function in your build)
+-- get linked player inventory (THIS is the correct function in your build
 local items = inv.getInventory()
 
 if not items then
