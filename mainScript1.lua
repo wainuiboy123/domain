@@ -4,7 +4,7 @@ if not inv then
     error("inventory_manager not found")
 end
 
--- get all items from the bound player (memory card must already be inserted)
+-- get all items from the bound player (memory card must already be inserted
 local items = inv.getPlayerItems()
 
 if not items then
