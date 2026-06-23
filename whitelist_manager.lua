@@ -58,7 +58,7 @@ local function drawUI()
     --drawFrame(1, 1, 51, 3, colors.LightGray)
     drawButton()
     drawText(1, 1, "Whitelist Manager", colors.white)
-    for i, v in getOnlinePlayers() do
+    for i, v in pd.getOnlinePlayers() do
         drawText(1, 1, i, colors.white)
     end
     
