@@ -6,7 +6,7 @@
 --    • player_detector  — detects nearby players
 --    • chatBox          — sends chat messages
 --    • monitor          — 10 wide x 4 tall (text scale 0.5)
---    • inventory (chest) — for confiscated items
+--    • inventory (chest) — for confiscted items
 --
 --  Files saved to disk:
 --    players.json       — all player record
