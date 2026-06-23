@@ -9,7 +9,7 @@
 --    • inventory (chest) — for confiscated items
 --
 --  Files saved to disk:
---    players.json       — all player records
+--    players.json       — all player record
 --    message_id.txt     — Discord webhook message ID
 -- ============================================================
 
