@@ -15,7 +15,7 @@ local UPDATE_INTERVAL = 5   -- seconds between each edit
 local BOT_USERNAME    = "Player Tracker"
 
 -- ── Locate the player detector peripheral ───────────────────
-local detector = peripheral.find("playerDetector")
+local detector = peripheral.find("player_detector")
 if not detector then
     error("No Player Detector found! Make sure it is connected to this computer.", 0)
 end
