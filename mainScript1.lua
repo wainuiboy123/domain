@@ -1,4 +1,4 @@
-local inv = peripheral.find("inventoryManager")
+local inv = peripheral.find("inventory_manager")
 
 if not inv then
     error("Inventory Manager not found!")
