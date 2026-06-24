@@ -25,7 +25,7 @@ local ID_FILE         = "tracker_message_id.txt"
 -- Any player within WARN_RADIUS metres who has rank 0 (unknown/visitor)
 -- will receive a warning message every WARN_INTERVAL seconds.
 local WARN_RADIUS      = 200          -- metres from the detector
-local WARN_INTERVAL    = 10           -- seconds between repeated warnings
+local WARN_INTERVAL    = 1            -- seconds between repeated warnings
 local WARN_MESSAGE     = "WARNING: You are approaching a restricted base. Turn around immediately or you will be removed."
 local WARN_SENDER      = "Base Security"   -- name shown in chat
 local WARN_PREFIX      = "&c[!]&r "        -- colour prefix (§c = red in MC formatting)
@@ -167,12 +167,9 @@ local rankCacheTime = -math.huge   -- force a fetch on first use
 local function parseRanksFromEmbed(description)
     local data = {}
     if not description then return data end
-    local block = description:match("```
-?(.-)
-?```")
+    local block = description:match("```[^\n]*\n(.-)\n?```")
     if not block then return data end
-    for line in block:gmatch("[^
-]+") do
+    for line in block:gmatch("[^\n]+") do
         local name, lvl = line:match("^(.-):(-?%d+)$")
         if name and lvl then
             lvl = tonumber(lvl)
