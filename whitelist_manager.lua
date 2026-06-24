@@ -1,9 +1,11 @@
 --====================================================--
 --   BASE WHITELIST / RANK MANAGER
 --   For CC: Tweaked + Advanced Peripherals
---   Requires: a Monitor, a "player_detector", and an
---             "nbt_storage" peripheral connected via
---             wired/ender modem (or directly adjacent).
+--   Requires: a Monitor, a "player_detector" peripheral,
+--             and an enabled HTTP API (this computer must
+--             be allowed to reach discord.com).
+--   Ranks are stored entirely in a Discord message via a
+--   webhook, which gets edited in place on every change.
 --====================================================--
 
 --========== PERIPHERAL SETUP ==========--
@@ -18,10 +20,18 @@ if not detector then
     error("No player_detector connected!")
 end
 
-local nbt = peripheral.find("nbt_storage")
-if not nbt then
-    error("No nbt_storage connected!")
-end
+--========== DISCORD WEBHOOK CONFIG ==========--
+-- Paste your webhook URL below. Create one in Discord via:
+--   Channel Settings -> Integrations -> Webhooks -> New Webhook -> Copy Webhook URL
+-- NOTE: this computer needs HTTP enabled, and "discord.com" must be allowed
+-- in the server's CC: Tweaked config (http.rules) or this will fail to connect.
+local WEBHOOK_URL = "https://discord.com/api/webhooks/PUT_YOUR_WEBHOOK_ID/PUT_YOUR_WEBHOOK_TOKEN"
+
+-- The message ID gets cached here on disk so we know which Discord message
+-- to edit. This file holds ONLY an id (no rank data) -- ranks themselves
+-- live in Discord. If this file is ever lost, the program will just post
+-- a fresh message and start caching its id again.
+local MSG_ID_FILE = "/disc_whitelist_msg_id.txt"
 
 -- Combine all monitors into one virtual "mon" (mirrors original script's approach)
 local mon = {}
@@ -86,46 +96,208 @@ local rowsVisible = 0
 
 local button = {}          -- clickable regions: buttons + player rows
 
---========== NBT PERSISTENCE ==========--
+--========== DISCORD PERSISTENCE ==========--
 
-local function loadData()
-    local ok, data = pcall(function() return nbt.read() end)
-    rankData = {}
-    if ok and type(data) == "table" then
-        for k, v in pairs(data) do
-            local lvl = tonumber(v)
+-- A small status flag so the UI can show sync state without blocking clicks.
+local syncStatus = "idle"   -- "idle" | "syncing" | "error"
+local lastError = nil
+
+local function getCachedMessageId()
+    if not fs.exists(MSG_ID_FILE) then return nil end
+    local h = fs.open(MSG_ID_FILE, "r")
+    if not h then return nil end
+    local id = h.readAll()
+    h.close()
+    id = id and id:gsub("%s+", "") or nil
+    if id == "" then return nil end
+    return id
+end
+
+local function setCachedMessageId(id)
+    local h = fs.open(MSG_ID_FILE, "w")
+    if h then
+        h.write(id)
+        h.close()
+    end
+end
+
+-- Builds the embed body Discord will display, and a fenced data block
+-- ("username:level" per line) that we parse back out on load. Keeping the
+-- data in a code block makes the message human-readable AND machine-parseable.
+local function buildEmbedPayload(data)
+    local names = {}
+    for k in pairs(data) do table.insert(names, k) end
+    table.sort(names, function(a, b)
+        if data[a] ~= data[b] then return data[a] > data[b] end
+        return a < b
+    end)
+
+    local lines = {}
+    local dataLines = {}
+    for _, name in ipairs(names) do
+        local lvl = data[name]
+        local info = RANKS[lvl] or RANKS[0]
+        table.insert(lines, string.format("**%s** — %s (%d)", name, info.name, lvl))
+        table.insert(dataLines, string.format("%s:%d", name, lvl))
+    end
+    if #lines == 0 then
+        table.insert(lines, "_No ranked players yet._")
+    end
+
+    local description = table.concat(lines, "\n")
+        .. "\n```\n" .. table.concat(dataLines, "\n") .. "\n```"
+
+    return {
+        embeds = {
+            {
+                title = "Base Whitelist - Current Ranks",
+                description = description,
+                color = 0x2ECC71,
+                footer = { text = "Last updated automatically by the whitelist computer" },
+            },
+        },
+    }
+end
+
+-- Parses the fenced "username:level" block back out of a message's embed description.
+local function parseRanksFromDescription(description)
+    local data = {}
+    if not description then return data end
+    local block = description:match("```\n?(.-)\n?```")
+    if not block then return data end
+    for line in block:gmatch("[^\r\n]+") do
+        local name, lvl = line:match("^(.-):(-?%d+)$")
+        if name and lvl then
+            lvl = tonumber(lvl)
             if lvl and lvl >= MIN_RANK and lvl <= MAX_RANK and lvl ~= 0 then
-                rankData[k] = lvl
+                data[name] = lvl
             end
+        end
+    end
+    return data
+end
+
+-- Waits for a specific http_success/http_failure pair matching `url`,
+-- re-queueing any unrelated events so the main loop doesn't lose them
+-- (monitor touches, timers, playerJoin/playerLeave, etc).
+local function waitForHttp(url)
+    while true do
+        local event, evUrl, p3, p4 = os.pullEvent()
+        if (event == "http_success" or event == "http_failure") and evUrl == url then
+            return event, p3, p4
+        else
+            os.queueEvent(event, evUrl, p3, p4)
+            -- yield so we don't spin hot if nothing else is pulling these
+            os.sleep(0)
         end
     end
 end
 
+-- Pushes the given rank table to Discord: edits the cached message if we have
+-- one, otherwise posts a new message (with ?wait=true so we get its id back).
+local function pushToDiscord(data)
+    syncStatus = "syncing"
+    local payload = buildEmbedPayload(data)
+    local body = textutils.serialiseJSON(payload)
+    local headers = { ["Content-Type"] = "application/json" }
+
+    local msgId = getCachedMessageId()
+
+    if msgId then
+        local patchUrl = WEBHOOK_URL .. "/messages/" .. msgId
+        local ok = pcall(http.request, {
+            url = patchUrl,
+            body = body,
+            method = "PATCH",
+            headers = headers,
+        })
+        if ok then
+            local event, handle = waitForHttp(patchUrl)
+            if event == "http_success" then
+                if handle then handle.close() end
+                syncStatus = "idle"
+                return true
+            end
+            -- PATCH failed (message likely deleted on Discord's side) --
+            -- fall through below and post a fresh message instead.
+            msgId = nil
+        end
+    end
+
+    if not msgId then
+        local postUrl = WEBHOOK_URL .. "?wait=true"
+        local ok = pcall(http.request, {
+            url = postUrl,
+            body = body,
+            method = "POST",
+            headers = headers,
+        })
+        if not ok then
+            syncStatus = "error"
+            lastError = "Failed to send HTTP request"
+            return false
+        end
+        local event, handle = waitForHttp(postUrl)
+        if event == "http_success" then
+            local respBody = handle.readAll()
+            handle.close()
+            local parsed = textutils.unserialiseJSON(respBody)
+            if parsed and parsed.id then
+                setCachedMessageId(parsed.id)
+            end
+            syncStatus = "idle"
+            return true
+        else
+            syncStatus = "error"
+            lastError = "Discord rejected the request"
+            return false
+        end
+    end
+
+    syncStatus = "error"
+    return false
+end
+
+-- Pulls the current rank table from the Discord message (recovery path / boot load).
+local function pullFromDiscord()
+    local msgId = getCachedMessageId()
+    if not msgId then return {} end
+
+    local getUrl = WEBHOOK_URL .. "/messages/" .. msgId
+    local ok = pcall(http.request, { url = getUrl, method = "GET" })
+    if not ok then return {} end
+
+    local event, handle = waitForHttp(getUrl)
+    if event == "http_success" then
+        local respBody = handle.readAll()
+        handle.close()
+        local parsed = textutils.unserialiseJSON(respBody)
+        if parsed and parsed.embeds and parsed.embeds[1] then
+            return parseRanksFromDescription(parsed.embeds[1].description)
+        end
+        return {}
+    end
+    return {}
+end
+
+local function loadData()
+    rankData = pullFromDiscord()
+end
+
 local function saveData()
-    -- Only ranks above 0 (or blacklisted at -1) get persisted; 0 is default and never stored.
+    -- Only ranks above 0 (or blacklisted at -1) ever get persisted; 0 is
+    -- default and is never written to the Discord message.
     local toSave = {}
     for k, v in pairs(rankData) do
         if v ~= 0 then
             toSave[k] = v
         end
     end
-    nbt.writeTable(toSave)
+    pushToDiscord(toSave)
 end
 
 local function getRank(username)
     return rankData[username] or 0
-end
-
-local function setRank(username, level)
-    if level <= 0 then
-        rankData[username] = nil   -- 0 or below default isn't stored... but -1 (blacklist) must persist
-    end
-    if level == 0 then
-        rankData[username] = nil
-    else
-        rankData[username] = level
-    end
-    saveData()
 end
 
 --========== DRAW HELPERS ==========--
@@ -148,6 +320,21 @@ end
 
 local function drawHeader()
     centerText(1, "BASE WHITELIST MANAGER", colors.yellow, THEME.bg)
+
+    -- small sync-status indicator in the top-right corner
+    mon.setBackgroundColor(THEME.bg)
+    mon.setCursorPos(W - 9, 1)
+    if syncStatus == "syncing" then
+        mon.setTextColor(colors.yellow)
+        mon.write("Syncing..")
+    elseif syncStatus == "error" then
+        mon.setTextColor(colors.red)
+        mon.write("Sync FAIL")
+    else
+        mon.setTextColor(colors.lime)
+        mon.write(" Synced  ")
+    end
+
     mon.setBackgroundColor(colors.gray)
     mon.setTextColor(colors.white)
     mon.setCursorPos(1, 2)
@@ -287,29 +474,37 @@ end
 
 --========== ACTION BUTTONS ==========--
 
+-- Applies a local rank change, redraws immediately (so the screen never
+-- looks frozen), then syncs to Discord in the background and redraws again
+-- once that finishes (to confirm success or flag an error).
+local function applyRankChange(username, newLevel)
+    if newLevel == 0 then
+        rankData[username] = nil
+    else
+        rankData[username] = newLevel
+    end
+    refreshPlayerList()
+    drawScreen()           -- instant feedback, shows "Syncing..."
+    saveData()              -- blocking HTTP call to Discord
+    refreshPlayerList()
+    drawScreen()            -- final state, shows "Synced" or "Sync FAIL"
+end
+
 local function doPromote()
     if not selectedName then return end
-    local lvl = getRank(selectedName)
-    lvl = math.min(MAX_RANK, lvl + 1)
-    setRank(selectedName, lvl)
-    refreshPlayerList()
-    drawScreen()
+    local lvl = math.min(MAX_RANK, getRank(selectedName) + 1)
+    applyRankChange(selectedName, lvl)
 end
 
 local function doDemote()
     if not selectedName then return end
-    local lvl = getRank(selectedName)
-    lvl = math.max(MIN_RANK, lvl - 1)
-    setRank(selectedName, lvl)
-    refreshPlayerList()
-    drawScreen()
+    local lvl = math.max(MIN_RANK, getRank(selectedName) - 1)
+    applyRankChange(selectedName, lvl)
 end
 
 local function doBlacklist()
     if not selectedName then return end
-    setRank(selectedName, -1)
-    refreshPlayerList()
-    drawScreen()
+    applyRankChange(selectedName, -1)
 end
 
 local function drawActionButtons()
@@ -398,6 +593,13 @@ local function checkClick(x, y)
 end
 
 local function main()
+    -- quick boot screen while we pull the current ranks from Discord
+    mon.setBackgroundColor(THEME.bg)
+    mon.clear()
+    mon.setTextColor(colors.yellow)
+    mon.setCursorPos(2, 2)
+    mon.write("Loading ranks from Discord...")
+
     loadData()
     refreshPlayerList()
     drawScreen()
