@@ -20,6 +20,21 @@ local UPDATE_INTERVAL = 0
 local BOT_USERNAME    = "Player Tracker"
 local ID_FILE         = "tracker_message_id.txt"
 
+-- ── Warning chatbox config ───────────────────────────────────
+-- Attach a Chat Box peripheral named "chat_box" to this computer.
+-- Any player within WARN_RADIUS metres who has rank 0 (unknown/visitor)
+-- will receive a warning message every WARN_INTERVAL seconds.
+local WARN_RADIUS      = 200          -- metres from the detector
+local WARN_INTERVAL    = 10           -- seconds between repeated warnings
+local WARN_MESSAGE     = "WARNING: You are approaching a restricted base. Turn around immediately or you will be removed."
+local WARN_SENDER      = "Base Security"   -- name shown in chat
+local WARN_PREFIX      = "&c[!]&r "        -- colour prefix (§c = red in MC formatting)
+
+-- Rank source — same webhook + message the elevator uses
+local RANK_WEBHOOK_URL = "https://discord.com/api/webhooks/1519150777174724640/5RcOy3OPeehsFBw1wgHhxgszeLRkIKDufW4sg64QCe1kLHqYuR5nOv4JRTO8xZPd8mhF"
+local RANK_MESSAGE_ID  = "1519151496346730529"
+local RANK_CACHE_SEC   = 30           -- how often to re-fetch ranks from Discord
+
 -- Default detector position used when the detector can't report its own coords.
 local DEFAULT_X = -2306
 local DEFAULT_Y = 64
@@ -48,6 +63,14 @@ local detectorName = peripheral.getName(detector)
 
 local monitor = peripheral.find("monitor")
 if not monitor then error("No Monitor found!", 0) end
+
+-- Chat box is optional — warnings are skipped if not present
+local chatBox = peripheral.find("chat_box")
+if chatBox then
+    print("Chat Box: found (" .. peripheral.getName(chatBox) .. ")")
+else
+    print("[WARN] No chat_box peripheral found — proximity warnings disabled.")
+end
 
 print("Detector: " .. detectorName)
 print("Monitor:  " .. peripheral.getName(monitor))
@@ -133,6 +156,114 @@ local function sortedList(tbl)
     end
     table.sort(list, function(a, b) return a.distance < b.distance end)
     return list
+end
+
+-- ════════════════════════════════════════════════════════════
+--  RANK LOOKUP  (mirrors elevator script — reads same Discord message)
+-- ════════════════════════════════════════════════════════════
+local rankCache     = {}
+local rankCacheTime = -math.huge   -- force a fetch on first use
+
+local function parseRanksFromEmbed(description)
+    local data = {}
+    if not description then return data end
+    local block = description:match("```
+?(.-)
+?```")
+    if not block then return data end
+    for line in block:gmatch("[^
+]+") do
+        local name, lvl = line:match("^(.-):(-?%d+)$")
+        if name and lvl then
+            lvl = tonumber(lvl)
+            -- 0 is default (never stored), negative = blacklisted
+            if lvl and lvl ~= 0 then
+                data[name] = lvl
+            end
+        end
+    end
+    return data
+end
+
+local function refreshRankCache()
+    local url = RANK_WEBHOOK_URL .. "/messages/" .. RANK_MESSAGE_ID
+    local response = http.get(url)
+    if not response then
+        print("[Ranks] HTTP GET failed — keeping stale cache")
+        return
+    end
+    local body   = response.readAll()
+    local status = response.getResponseCode()
+    response.close()
+    if status ~= 200 then
+        print("[Ranks] Bad HTTP status " .. status .. " — keeping stale cache")
+        return
+    end
+    local parsed = textutils.unserialiseJSON(body)
+    if parsed and parsed.embeds and parsed.embeds[1] then
+        rankCache     = parseRanksFromEmbed(parsed.embeds[1].description)
+        rankCacheTime = os.clock()
+        local count = 0
+        for _ in pairs(rankCache) do count = count + 1 end
+        print("[Ranks] Loaded " .. count .. " entries.")
+    else
+        print("[Ranks] Could not parse embed — keeping stale cache")
+    end
+end
+
+-- Returns the rank level for a player (0 = unknown/visitor).
+local function getPlayerRank(username)
+    if os.clock() - rankCacheTime > RANK_CACHE_SEC then
+        refreshRankCache()
+    end
+    return rankCache[username] or 0
+end
+
+-- ════════════════════════════════════════════════════════════
+--  PROXIMITY WARNING STATE
+-- ════════════════════════════════════════════════════════════
+-- Tracks when each player was last warned so we don't spam every tick.
+local lastWarned = {}   -- [username] = os.clock() of last warning sent
+
+local function sendWarning(username)
+    if not chatBox then return end
+    -- Advanced Peripherals Chat Box API: sendMessageToPlayer(message, username, sender, prefix)
+    local ok, err = pcall(function()
+        chatBox.sendMessageToPlayer(WARN_MESSAGE, username, WARN_SENDER, WARN_PREFIX)
+    end)
+    if not ok then
+        print("[ChatBox] Failed to warn " .. username .. ": " .. tostring(err))
+    end
+end
+
+local function checkProximityWarnings()
+    if not chatBox then return end
+    local now = os.clock()
+    -- Check every currently-online player
+    for name, data in pairs(onlinePlayers) do
+        if data.distance <= WARN_RADIUS then
+            local rank = getPlayerRank(name)
+            if rank <= 0 then
+                -- Rank 0 or below (blacklisted) — warn them
+                local lastTime = lastWarned[name] or -math.huge
+                if now - lastTime >= WARN_INTERVAL then
+                    sendWarning(name)
+                    lastWarned[name] = now
+                    print("[Warn] Warned " .. name .. " (rank " .. rank .. ", dist " .. string.format("%.0f", data.distance) .. "m)")
+                end
+            end
+        else
+            -- Player moved out of range — reset their warning timer so they
+            -- get warned again immediately if they come back.
+            lastWarned[name] = nil
+        end
+    end
+    -- Clean up entries for players who went offline
+    for name in pairs(lastWarned) do
+        if not onlinePlayers[name] then
+            lastWarned[name] = nil
+        end
+    end
 end
 
 -- ════════════════════════════════════════════════════════════
@@ -483,6 +614,7 @@ while true do
     sleep(UPDATE_INTERVAL)
     local ok2, err = pcall(function()
         updatePlayerState()
+        checkProximityWarnings()
         renderMonitor()
         editMessage(messageId, buildDiscordContent())
     end)
