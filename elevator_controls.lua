@@ -55,11 +55,11 @@ local FLOOR_COMPUTERS = {
 -- Keys MUST match FLOOR_COMPUTERS above.
 
 local FLOORS = {
-    top     = { side = "bottom",    pulseSeconds = 1 },
-    tunnel  = { side = "bottom",    pulseSeconds = 1 },
-    storage = { side = "bottom",    pulseSeconds = 1 },
-    testing = { side = "bottom",    pulseSeconds = 1 },
-    command = { side = "bottom",    pulseSeconds = 1 },
+    top     = { side = "bottom", pulseSeconds = 1 },
+    tunnel  = { side = "bottom", pulseSeconds = 1 },
+    storage = { side = "bottom", pulseSeconds = 1 },
+    testing = { side = "bottom", pulseSeconds = 1 },
+    command = { side = "bottom", pulseSeconds = 1 },
 }
 
 --========== BUTTON CONFIG (CUSTOMIZE ME) ==========--
@@ -202,10 +202,12 @@ local function parseRanksFromDescription(description)
     return data
 end
 
--- Async-safe HTTP wait: re-queues unrelated events so nothing is lost.
+-- Async-safe HTTP wait: uses os.pullEventRaw (not os.pullEvent) so that
+-- http_success / http_failure events are NOT silently filtered out.
+-- Unrelated events are re-queued so nothing else is lost.
 local function waitForHttp(url)
     while true do
-        local event, evUrl, p3, p4 = os.pullEvent()
+        local event, evUrl, p3, p4 = os.pullEventRaw()
         if (event == "http_success" or event == "http_failure") and evUrl == url then
             return event, p3, p4
         else
@@ -217,22 +219,53 @@ end
 
 local function refreshRankCache()
     local msgId = getCachedMessageId()
-    if not msgId then return false end
-    local getUrl = WEBHOOK_URL .. "/messages/" .. msgId
-    local ok = pcall(http.request, { url = getUrl, method = "GET" })
-    if not ok then return false end
-    local event, handle = waitForHttp(getUrl)
-    if event == "http_success" then
-        local body = handle.readAll()
-        handle.close()
-        local parsed = textutils.unserialiseJSON(body)
-        if parsed and parsed.embeds and parsed.embeds[1] then
-            rankCache     = parseRanksFromDescription(parsed.embeds[1].description)
-            rankCacheTime = os.clock()
-            return true
-        end
+    if not msgId then
+        print("[Ranks] No message ID file found at " .. MSG_ID_FILE)
+        return false
     end
-    return false
+
+    local getUrl = WEBHOOK_URL .. "/messages/" .. msgId
+    print("[Ranks] Fetching rank data from Discord...")
+
+    local ok, err = pcall(http.request, { url = getUrl, method = "GET" })
+    if not ok then
+        print("[Ranks] http.request failed: " .. tostring(err))
+        return false
+    end
+
+    local event, handle, errMsg = waitForHttp(getUrl)
+    if event == "http_failure" then
+        print("[Ranks] HTTP request failed: " .. tostring(errMsg))
+        return false
+    end
+
+    local body = handle.readAll()
+    handle.close()
+
+    local parsed = textutils.unserialiseJSON(body)
+    if not parsed then
+        print("[Ranks] Failed to parse JSON response")
+        return false
+    end
+    if not (parsed.embeds and parsed.embeds[1]) then
+        print("[Ranks] No embeds found in Discord message")
+        return false
+    end
+
+    local newCache = parseRanksFromDescription(parsed.embeds[1].description)
+    local count = 0
+    for _ in pairs(newCache) do count = count + 1 end
+
+    if count == 0 then
+        print("[Ranks] WARNING: Parsed 0 ranks. Check the embed description format.")
+        print("[Ranks] Description preview: " .. tostring(parsed.embeds[1].description or "nil"):sub(1, 120))
+    else
+        print("[Ranks] Loaded " .. count .. " rank entries.")
+    end
+
+    rankCache     = newCache
+    rankCacheTime = os.clock()
+    return true
 end
 
 local function getRank(username)
