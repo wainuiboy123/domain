@@ -3,16 +3,22 @@
 --   For CC: Tweaked + Advanced Peripherals
 --   Requires: a 1x1 Monitor + a "player_detector"
 --             peripheral, both connected to this computer,
---             PLUS a wireless or ender modem (this computer
---             rides on a moving structure, so it talks to
---             the stationary receiver computer wirelessly
---             instead of wiring redstone directly).
+--             PLUS an Ender Modem (this computer rides on a
+--             moving structure, so it talks to the floor
+--             computers wirelessly instead of wiring
+--             redstone directly).
 --
---   This is the PANEL half of a two-script system. You also
---   need "elevator_receiver.lua" running on a SEPARATE,
---   stationary computer that is actually wired into the
---   redstone for each floor. That receiver computer listens
---   for messages sent by this panel and fires the redstone.
+--   This is the PANEL half of a six-computer system:
+--     1 panel computer (this script) +
+--     5 floor receiver computers (run "elevator_receiver.lua"
+--     on each one -- one per floor, each wired into that
+--     floor's own redstone).
+--
+--   Each floor button below is tied to a SPECIFIC receiver
+--   computer's ID. When a button is selected and the player
+--   detector is right-clicked, the panel sends the request
+--   directly to that one floor's computer -- not a shared
+--   "floorId" routed through a single receiver.
 --
 --   Reads player ranks from the SAME Discord webhook
 --   message used by the whitelist manager script, so both
@@ -33,23 +39,33 @@ end
 
 local modem = peripheral.find("modem")
 if not modem then
-    error("No wireless/ender modem connected! This panel needs one since " ..
-          "it's on a moving structure and can't wire redstone directly.")
+    error("No Ender Modem connected! This panel needs one since it's on a " ..
+          "moving structure and can't wire redstone directly.")
 end
 
 mon.setTextScale(0.5)
 local W, H = mon.getSize()
 
---========== WIRELESS CONFIG ==========--
--- The rednet/computer ID of the stationary receiver computer. To find it,
--- boot up the receiver computer and look at the ID it prints on its own
--- screen (elevator_receiver.lua prints its own ID on startup), or run the
--- "id" program in its shell.
-local RECEIVER_ID = 0  -- <-- CHANGE THIS to your receiver computer's ID
+--========== FLOOR / RECEIVER COMPUTER IDS (CUSTOMIZE ME) ==========--
+-- Put every floor's receiver computer ID here. To find a computer's ID,
+-- boot it up and look at the top of its screen -- elevator_receiver.lua
+-- prints its own ID on startup -- or run the "id" program in its shell.
+--
+-- These IDs are referenced by the BUTTONS list and DEFAULT_FLOOR further
+-- down, so set them ALL here first and you won't need to hunt through the
+-- rest of the script.
 
--- A shared "password" of sorts so the receiver only reacts to messages from
--- this panel and not random rednet traffic. Change it to anything; just make
--- sure elevator_receiver.lua uses the exact same string.
+local RECEIVER_IDS = {
+    topFloor     = 15,  -- <-- CHANGE to the Top Floor computer's ID
+    tunnel       = 12,  -- <-- CHANGE to the Tunnel computer's ID
+    testingFloor = 11,  -- <-- CHANGE to the Testing Floor computer's ID
+    fourthFloor  = 13,  -- <-- CHANGE to the 4th floor computer's ID
+    commandFloor = 14,  -- <-- CHANGE to the Command Floor computer's ID
+}
+
+-- A shared "password" of sorts so receivers only react to messages from
+-- this panel and not random rednet traffic. Change it to anything; just
+-- make sure every elevator_receiver.lua uses the exact same string.
 local PROTOCOL = "elevator_panel_v1"
 
 rednet.open(peripheral.getName(modem))
@@ -58,7 +74,7 @@ print("This panel's computer ID is: " .. os.getComputerID())
 --========== DISCORD WEBHOOK CONFIG ==========--
 -- Use the EXACT SAME webhook URL as the whitelist manager script, so this
 -- panel reads the same rank data that script writes.
-local WEBHOOK_URL = "https://discord.com/api/webhooks/PUT_YOUR_WEBHOOK_ID/PUT_YOUR_WEBHOOK_TOKEN"
+local WEBHOOK_URL = "https://discord.com/api/webhooks/1519150777174724640/5RcOy3OPeehsFBw1wgHhxgszeLRkIKDufW4sg64QCe1kLHqYuR5nOv4JRTO8xZPd8mhF"
 
 -- Cached message id -- must point at the SAME message the whitelist script
 -- maintains. Easiest way to guarantee that: copy the whitelist computer's
@@ -75,21 +91,19 @@ local RANK_CACHE_SECONDS = 15
 -- requiredRank: minimum rank LEVEL needed to use this button
 --               (-1 Blacklisted, 0 Visitor(default), 1 Visitor, 2 Recruit,
 --                3 Member, 4 Officer, 5 Senior Officer, 6 Command)
--- floorId:      a short identifier sent to the receiver computer, which
---               decides what side/duration to pulse for this floor.
---               (Keeping the side/duration config on the RECEIVER means the
---               moving panel doesn't need to know any wiring details.)
+-- receiverId:   which floor's receiver computer this button targets
+--               (pulled from RECEIVER_IDS above)
 
 local BUTTONS = {
-    { label = "GROUND",   requiredRank = 0, floorId = "ground" },
-    { label = "BASEMENT", requiredRank = 2, floorId = "basement" },
-    { label = "VAULT",    requiredRank = 4, floorId = "vault" },
-    { label = "COMMAND",  requiredRank = 6, floorId = "command" },
+    { label = "TUNNEL",   requiredRank = 3, receiverId = RECEIVER_IDS.tunnel },
+    { label = "TESTING",  requiredRank = 4, receiverId = RECEIVER_IDS.testingFloor },
+    { label = "4TH FLR",  requiredRank = 4, receiverId = RECEIVER_IDS.fourthFloor },
+    { label = "COMMAND",  requiredRank = 5, receiverId = RECEIVER_IDS.commandFloor },
 }
 
 -- Right-clicking the player detector with NO button selected sends the
--- elevator to this floor instead. Give it its own required rank too.
-local DEFAULT_FLOOR = { label = "TOP", requiredRank = 0, floorId = "top" }
+-- elevator to this floor instead.
+local DEFAULT_FLOOR = { label = "TOP", requiredRank = 1, receiverId = RECEIVER_IDS.topFloor }
 
 --========== RANK DEFINITIONS ==========--
 -- Mirrors the whitelist manager script so rank names/levels line up exactly.
