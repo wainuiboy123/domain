@@ -33,7 +33,7 @@ local WARN_PREFIX      = "&c[!]&r "        -- colour prefix (§c = red in MC for
 -- Rank source — same webhook + message the elevator uses
 local RANK_WEBHOOK_URL = "https://discord.com/api/webhooks/1519150777174724640/5RcOy3OPeehsFBw1wgHhxgszeLRkIKDufW4sg64QCe1kLHqYuR5nOv4JRTO8xZPd8mhF"
 local RANK_MESSAGE_ID  = "1519151496346730529"
-local RANK_CACHE_SEC   = 30           -- how often to re-fetch ranks from Discord
+local RANK_CACHE_SEC   = 5            -- how often to re-fetch ranks from Discord
 
 -- Default detector position used when the detector can't report its own coords.
 local DEFAULT_X = -2306
@@ -316,7 +316,8 @@ local function httpPost(url, payload, headers)
     return body, (status >= 200 and status < 300), status
 end
 
--- Returns ok (bool), plus status so the caller can decide to restart.
+-- Returns body, success, status.
+-- Uses os.pullEventRaw so http_success/http_failure are not filtered out.
 local function httpPatch(url, payload, headers)
     headers = headers or {}
     headers["Content-Type"] = "application/json"
@@ -327,14 +328,19 @@ local function httpPatch(url, payload, headers)
         return nil, false, "request_failed"
     end
     while true do
-        local event, _, handle = os.pullEvent()
-        if event == "http_success" then
+        local event, evUrl, handle = os.pullEventRaw()
+        if event == "terminate" then
+            error("Terminated", 0)
+        elseif event == "http_success" and evUrl == url then
             local body   = handle.readAll()
             local status = handle.getResponseCode()
             handle.close()
             return body, (status >= 200 and status < 300), status
-        elseif event == "http_failure" then
+        elseif event == "http_failure" and evUrl == url then
             return nil, false, "http_failure"
+        else
+            -- Not our response — put it back and keep waiting
+            os.queueEvent(event, evUrl, handle)
         end
     end
 end
@@ -531,15 +537,15 @@ local function sendInitialMessage(content)
     return msg.id
 end
 
--- Returns true on success, false if the webhook couldn't be reached.
+-- Returns true on success, false on failure (logs but does NOT reboot —
+-- a transient Discord hiccup shouldn't kill the whole tracker).
 local function editMessage(messageId, content)
     local editUrl = WEBHOOK_URL .. "/messages/" .. messageId
     local payload = textutils.serialiseJSON({ content = content })
     local _, success, status = httpPatch(editUrl, payload)
     if not success then
-        print("[WARN] Discord edit failed (" .. tostring(status) .. ") — restarting in 5s...")
-        sleep(5)
-        os.reboot()
+        print("[WARN] Discord edit failed (" .. tostring(status) .. ") — will retry next cycle.")
+        return false
     end
     return true
 end
@@ -621,8 +627,7 @@ while true do
         print("[" .. os.time() .. "] Updated — " .. on .. " online, " .. off .. " offline")
     else
         print("[ERROR] " .. tostring(err))
-        print("Restarting in 5 seconds...")
-        sleep(5)
-        os.reboot()
+        print("Continuing after error...")
+        sleep(1)
     end
 end
