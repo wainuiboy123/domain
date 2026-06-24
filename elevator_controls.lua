@@ -55,11 +55,11 @@ local FLOOR_COMPUTERS = {
 -- Keys MUST match FLOOR_COMPUTERS above.
 
 local FLOORS = {
-    top     = { side = "top",    pulseSeconds = 1 },
-    tunnel  = { side = "top",    pulseSeconds = 1 },
-    storage = { side = "top",    pulseSeconds = 1 },
-    testing = { side = "top",    pulseSeconds = 1 },
-    command = { side = "top",    pulseSeconds = 1 },
+    top     = { side = "bottom",    pulseSeconds = 1 },
+    tunnel  = { side = "bottom",    pulseSeconds = 1 },
+    storage = { side = "bottom",    pulseSeconds = 1 },
+    testing = { side = "bottom",    pulseSeconds = 1 },
+    command = { side = "bottom",    pulseSeconds = 1 },
 }
 
 --========== BUTTON CONFIG (CUSTOMIZE ME) ==========--
