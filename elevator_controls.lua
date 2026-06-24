@@ -1,152 +1,179 @@
 --====================================================--
---   ELEVATOR CALL PANEL
+--   ELEVATOR FLOOR PANEL  (unified panel + receiver)
 --   For CC: Tweaked + Advanced Peripherals
---   Requires: a 1x1 Monitor + a "player_detector"
---             peripheral, both connected to this computer,
---             PLUS an Ender Modem (this computer rides on a
---             moving structure, so it talks to the floor
---             computers wirelessly instead of wiring
---             redstone directly).
 --
---   This is the PANEL half of a six-computer system:
---     1 panel computer (this script) +
---     5 floor receiver computers (run "elevator_receiver.lua"
---     on each one -- one per floor, each wired into that
---     floor's own redstone).
+--   HARDWARE PER FLOOR (x5, one set per floor):
+--     - 1 CC:Tweaked computer
+--     - 1 monitor (any size; text scale auto-adjusts)
+--     - 1 player_detector peripheral (Advanced Peripherals)
+--     - 1 Ender Modem
+--   All four must be physically attached to the same computer.
 --
---   Each floor button below is tied to a SPECIFIC receiver
---   computer's ID. When a button is selected and the player
---   detector is right-clicked, the panel sends the request
---   directly to that one floor's computer -- not a shared
---   "floorId" routed through a single receiver.
+--   HOW IT WORKS:
+--     Every floor runs this SAME script. Each computer is
+--     both a "panel" (shows buttons, reads player clicks) and
+--     a "receiver" (listens for requests from other floors and
+--     pulses its own local redstone to move the elevator).
 --
---   Reads player ranks from the SAME Discord webhook
---   message used by the whitelist manager script, so both
---   programs always agree on everyone's rank.
+--     When a player right-clicks the detector and a floor
+--     button is selected, this computer sends a rednet message
+--     directly to THAT floor's computer. That computer then
+--     pulses its local redstone output, which triggers whatever
+--     mechanism calls the elevator to that level.
+--
+--   SETUP STEPS:
+--     1. Place hardware on all 5 floors. Boot each computer
+--        and note its ID (shown on startup, or run "id").
+--     2. Fill in FLOOR_COMPUTERS below with all 5 IDs.
+--     3. Fill in FLOORS to match each floor's local redstone
+--        wiring (which side, how long to pulse).
+--     4. Adjust BUTTONS rank requirements if needed.
+--     5. Copy this file to /startup.lua on every floor computer
+--        so it restarts automatically after reboots.
+--     6. Fill in WEBHOOK_URL + ensure MSG_ID_FILE exists on
+--        each computer (copy from your whitelist manager computer).
 --====================================================--
 
---========== PERIPHERAL SETUP ==========--
+--========== FLOOR COMPUTER IDs (CUSTOMIZE ME) ==========--
+-- Map a friendly name -> computer ID for each floor.
+-- Run this script once on each computer; it prints its own ID.
+-- Keys here are used in FLOORS and BUTTONS below.
 
-local mon = peripheral.find("monitor")
-if not mon then
-    error("No monitor connected! Attach a 1x1 monitor to this computer.")
-end
-
-local detector = peripheral.find("player_detector")
-if not detector then
-    error("No player_detector connected!")
-end
-
-local modem = peripheral.find("modem")
-if not modem then
-    error("No Ender Modem connected! This panel needs one since it's on a " ..
-          "moving structure and can't wire redstone directly.")
-end
-
-mon.setTextScale(0.5)
-local W, H = mon.getSize()
-
---========== FLOOR / RECEIVER COMPUTER IDS (CUSTOMIZE ME) ==========--
--- Put every floor's receiver computer ID here. To find a computer's ID,
--- boot it up and look at the top of its screen -- elevator_receiver.lua
--- prints its own ID on startup -- or run the "id" program in its shell.
---
--- These IDs are referenced by the BUTTONS list and DEFAULT_FLOOR further
--- down, so set them ALL here first and you won't need to hunt through the
--- rest of the script.
-
-local RECEIVER_IDS = {
-    topFloor     = 15,  -- <-- CHANGE to the Top Floor computer's ID
-    tunnel       = 12,  -- <-- CHANGE to the Tunnel computer's ID
-    testingFloor = 11,  -- <-- CHANGE to the Testing Floor computer's ID
-    fourthFloor  = 13,  -- <-- CHANGE to the 4th floor computer's ID
-    commandFloor = 14,  -- <-- CHANGE to the Command Floor computer's ID
+local FLOOR_COMPUTERS = {
+    top     = 15,   -- <-- replace with Top Floor computer ID
+    tunnel  = 12,   -- <-- replace with Tunnel computer ID
+    storage = 11,   -- <-- replace with Storage computer ID
+    testing = 13,   -- <-- replace with Testing Floor computer ID
+    command = 14,   -- <-- replace with Command Floor computer ID
 }
 
--- A shared "password" of sorts so receivers only react to messages from
--- this panel and not random rednet traffic. Change it to anything; just
--- make sure every elevator_receiver.lua uses the exact same string.
-local PROTOCOL = "elevator_panel_v1"
+--========== FLOOR REDSTONE CONFIG (CUSTOMIZE ME) ==========--
+-- Each entry defines what THIS floor's computer does to its OWN
+-- redstone when it receives a "come here" request.
+-- side:         which redstone side to pulse
+-- pulseSeconds: how long the pulse lasts
+-- Keys MUST match FLOOR_COMPUTERS above.
 
-rednet.open(peripheral.getName(modem))
-print("This panel's computer ID is: " .. os.getComputerID())
-
---========== DISCORD WEBHOOK CONFIG ==========--
--- Use the EXACT SAME webhook URL as the whitelist manager script, so this
--- panel reads the same rank data that script writes.
-local WEBHOOK_URL = "https://discord.com/api/webhooks/1519150777174724640/5RcOy3OPeehsFBw1wgHhxgszeLRkIKDufW4sg64QCe1kLHqYuR5nOv4JRTO8xZPd8mhF"
-
--- Cached message id -- must point at the SAME message the whitelist script
--- maintains. Easiest way to guarantee that: copy the whitelist computer's
--- /disc_whitelist_msg_id.txt file onto this computer at the same path.
-local MSG_ID_FILE = "/disc_whitelist_msg_id.txt"
-
--- How long (in seconds) cached rank data is considered fresh before this
--- panel re-checks Discord. Keeps things snappy without hammering the API
--- on every single right-click.
-local RANK_CACHE_SECONDS = 15
+local FLOORS = {
+    top     = { side = "top",    pulseSeconds = 1 },
+    tunnel  = { side = "top",    pulseSeconds = 1 },
+    storage = { side = "top",    pulseSeconds = 1 },
+    testing = { side = "top",    pulseSeconds = 1 },
+    command = { side = "top",    pulseSeconds = 1 },
+}
 
 --========== BUTTON CONFIG (CUSTOMIZE ME) ==========--
+-- Each button sends the elevator to a different floor.
 -- label:        text shown on the button
--- requiredRank: minimum rank LEVEL needed to use this button
---               (-1 Blacklisted, 0 Visitor(default), 1 Visitor, 2 Recruit,
+-- requiredRank: minimum rank level to use this button
+--               (-1 Blacklisted, 0/1 Visitor, 2 Recruit,
 --                3 Member, 4 Officer, 5 Senior Officer, 6 Command)
--- receiverId:   which floor's receiver computer this button targets
---               (pulled from RECEIVER_IDS above)
+-- floorKey:     must match a key in FLOOR_COMPUTERS / FLOORS
 
 local BUTTONS = {
-    { label = "TUNNEL",   requiredRank = 3, receiverId = RECEIVER_IDS.tunnel },
-    { label = "STORAGE",  requiredRank = 3, receiverId = RECEIVER_IDS.testingFloor },
-    { label = "TESTING",  requiredRank = 4, receiverId = RECEIVER_IDS.fourthFloor },
-    { label = "COMMAND",  requiredRank = 5, receiverId = RECEIVER_IDS.commandFloor },
+    { label = "TOP",     requiredRank = 1, floorKey = "top"     },
+    { label = "TUNNEL",  requiredRank = 3, floorKey = "tunnel"  },
+    { label = "STORAGE", requiredRank = 3, floorKey = "storage" },
+    { label = "TESTING", requiredRank = 4, floorKey = "testing" },
+    { label = "COMMAND", requiredRank = 5, floorKey = "command" },
 }
 
--- Right-clicking the player detector with NO button selected sends the
--- elevator to this floor instead.
-local DEFAULT_FLOOR = { label = "TOP", requiredRank = 1, receiverId = RECEIVER_IDS.topFloor }
+-- Right-clicking with NO button selected sends the elevator here.
+local DEFAULT_FLOOR_KEY = "top"
+
+--========== PROTOCOL ==========--
+-- Shared secret so floor computers only react to each other.
+-- Change this string on ALL floors if you want (keep them identical).
+local PROTOCOL = "elevator_v1"
+
+--========== DISCORD RANK CONFIG ==========--
+local WEBHOOK_URL    = "https://discord.com/api/webhooks/1519150777174724640/5RcOy3OPeehsFBw1wgHhxgszeLRkIKDufW4sg64QCe1kLHqYuR5nOv4JRTO8xZPd8mhF"
+local MSG_ID_FILE    = "/disc_whitelist_msg_id.txt"
+local RANK_CACHE_SEC = 15   -- seconds before re-fetching rank data
 
 --========== RANK DEFINITIONS ==========--
--- Mirrors the whitelist manager script so rank names/levels line up exactly.
-
 local RANKS = {
-    [-1] = { name = "Blacklisted",     color = colors.red },
-    [0]  = { name = "Visitor",         color = colors.lightGray },
-    [1]  = { name = "Visitor",         color = colors.white },
-    [2]  = { name = "Recruit",         color = colors.lime },
-    [3]  = { name = "Member",          color = colors.lime },
-    [4]  = { name = "Officer",         color = colors.green },
-    [5]  = { name = "Senior Officer",  color = colors.green },
-    [6]  = { name = "Command",         color = colors.green },
+    [-1] = { name = "Blacklisted",    color = colors.red       },
+    [0]  = { name = "Visitor",        color = colors.lightGray },
+    [1]  = { name = "Visitor",        color = colors.white     },
+    [2]  = { name = "Recruit",        color = colors.lime      },
+    [3]  = { name = "Member",         color = colors.lime      },
+    [4]  = { name = "Officer",        color = colors.green     },
+    [5]  = { name = "Senior Officer", color = colors.green     },
+    [6]  = { name = "Command",        color = colors.green     },
 }
 local MIN_RANK = -1
 local MAX_RANK = 6
 
 --========== THEME ==========--
-
 local THEME = {
-    bg            = colors.black,
-    btnBg         = colors.white,
-    btnText       = colors.black,
-    btnSelectedBg = colors.green,
+    bg              = colors.black,
+    btnBg           = colors.white,
+    btnText         = colors.black,
+    btnSelectedBg   = colors.green,
     btnSelectedText = colors.white,
-    btnDeniedBg   = colors.red,
-    btnDeniedText = colors.white,
-    msgGood       = colors.lime,
-    msgBad        = colors.red,
+    msgGood         = colors.lime,
+    msgBad          = colors.red,
 }
 
---========== STATE ==========--
+--====================================================--
+--   PERIPHERAL INIT
+--====================================================--
 
-local selectedIndex = nil      -- index into BUTTONS, currently armed selection
-local rankCache = {}           -- { [username] = level }
-local rankCacheTime = 0        -- os.clock() time of last successful fetch
-local statusMessage = nil      -- transient message shown at the bottom
-local statusColor = colors.white
-local statusClearAt = 0
+local mon = peripheral.find("monitor")
+if not mon then
+    error("No monitor found! Attach a monitor to this computer.")
+end
 
-local buttonRegions = {}       -- clickable regions for monitor_touch
+local detector = peripheral.find("player_detector")
+if not detector then
+    error("No player_detector found! Attach one to this computer.")
+end
 
---========== DISCORD RANK LOOKUP ==========--
+local modem = peripheral.find("modem")
+if not modem then
+    error("No Ender Modem found! Attach one to this computer.")
+end
+
+rednet.open(peripheral.getName(modem))
+
+mon.setTextScale(0.5)
+local W, H = mon.getSize()
+
+-- Identify which floor this computer IS by matching its own ID.
+local MY_ID = os.getComputerID()
+local MY_FLOOR_KEY = nil
+for key, id in pairs(FLOOR_COMPUTERS) do
+    if id == MY_ID then
+        MY_FLOOR_KEY = key
+        break
+    end
+end
+
+print("=== Elevator Floor Panel ===")
+print("Computer ID : " .. MY_ID)
+if MY_FLOOR_KEY then
+    print("Identified as floor: " .. MY_FLOOR_KEY)
+else
+    print("WARNING: This computer's ID is not listed in FLOOR_COMPUTERS.")
+    print("Add it there so other floors can identify you.")
+end
+
+--====================================================--
+--   STATE
+--====================================================--
+
+local selectedIndex  = nil     -- currently highlighted button (index into BUTTONS)
+local rankCache      = {}      -- { [username] = level }
+local rankCacheTime  = 0       -- os.clock() of last successful fetch
+local statusMessage  = nil     -- transient bottom-of-screen notice
+local statusColor    = colors.white
+local statusClearAt  = 0
+local buttonRegions  = {}      -- clickable regions for monitor_touch
+
+--====================================================--
+--   DISCORD RANK LOOKUP
+--====================================================--
 
 local function getCachedMessageId()
     if not fs.exists(MSG_ID_FILE) then return nil end
@@ -155,12 +182,9 @@ local function getCachedMessageId()
     local id = h.readAll()
     h.close()
     id = id and id:gsub("%s+", "") or nil
-    if id == "" then return nil end
-    return id
+    return (id ~= "") and id or nil
 end
 
--- Parses the fenced "username:level" block back out of the embed description
--- (same format the whitelist manager script writes).
 local function parseRanksFromDescription(description)
     local data = {}
     if not description then return data end
@@ -178,9 +202,7 @@ local function parseRanksFromDescription(description)
     return data
 end
 
--- Waits for a specific http_success/http_failure pair matching `url`,
--- re-queueing any unrelated events so playerClick/monitor_touch/timers
--- that happen mid-request aren't lost.
+-- Async-safe HTTP wait: re-queues unrelated events so nothing is lost.
 local function waitForHttp(url)
     while true do
         local event, evUrl, p3, p4 = os.pullEvent()
@@ -196,18 +218,16 @@ end
 local function refreshRankCache()
     local msgId = getCachedMessageId()
     if not msgId then return false end
-
     local getUrl = WEBHOOK_URL .. "/messages/" .. msgId
     local ok = pcall(http.request, { url = getUrl, method = "GET" })
     if not ok then return false end
-
     local event, handle = waitForHttp(getUrl)
     if event == "http_success" then
-        local respBody = handle.readAll()
+        local body = handle.readAll()
         handle.close()
-        local parsed = textutils.unserialiseJSON(respBody)
+        local parsed = textutils.unserialiseJSON(body)
         if parsed and parsed.embeds and parsed.embeds[1] then
-            rankCache = parseRanksFromDescription(parsed.embeds[1].description)
+            rankCache     = parseRanksFromDescription(parsed.embeds[1].description)
             rankCacheTime = os.clock()
             return true
         end
@@ -216,31 +236,63 @@ local function refreshRankCache()
 end
 
 local function getRank(username)
-    -- Refresh if our cache is stale.
-    if os.clock() - rankCacheTime > RANK_CACHE_SECONDS then
+    if os.clock() - rankCacheTime > RANK_CACHE_SEC then
         refreshRankCache()
     end
     return rankCache[username] or 0
 end
 
---========== WIRELESS FLOOR REQUEST ==========--
+--====================================================--
+--   REDSTONE (receiver side)
+--====================================================--
 
--- Sends the floor request to the stationary receiver computer and waits
--- (briefly) for an acknowledgment so the panel can show success/failure.
--- Returns true if the receiver confirmed, false on timeout/no response.
-local function requestFloor(floorId)
-    rednet.send(RECEIVER_ID, { action = "goToFloor", floorId = floorId }, PROTOCOL)
+local function pulseRedstone(floorKey)
+    local cfg = FLOORS[floorKey]
+    if not cfg then
+        print("pulseRedstone: unknown floorKey '" .. tostring(floorKey) .. "'")
+        return
+    end
+    redstone.setOutput(cfg.side, true)
+    sleep(cfg.pulseSeconds)
+    redstone.setOutput(cfg.side, false)
+end
+
+--====================================================--
+--   WIRELESS FLOOR REQUEST (panel side)
+--====================================================--
+
+-- Sends a "move elevator here" request to the target floor's computer
+-- and waits up to 3 seconds for an acknowledgment.
+-- Returns true on confirmed ack, false on timeout.
+local function requestFloor(floorKey)
+    local targetId = FLOOR_COMPUTERS[floorKey]
+    if not targetId then
+        print("requestFloor: no computer ID for floor '" .. tostring(floorKey) .. "'")
+        return false
+    end
+
+    -- If the target IS this computer, just pulse locally and skip the network round-trip.
+    if targetId == MY_ID then
+        pulseRedstone(floorKey)
+        return true
+    end
+
+    rednet.send(targetId, { action = "goToFloor", floorKey = floorKey }, PROTOCOL)
 
     local timer = os.startTimer(3)
     while true do
         local event, p1, p2, p3 = os.pullEvent()
         if event == "rednet_message" then
             local senderId, message, protocol = p1, p2, p3
-            if senderId == RECEIVER_ID and protocol == PROTOCOL
-               and type(message) == "table" and message.action == "ack"
-               and message.floorId == floorId then
+            if senderId == targetId
+               and protocol == PROTOCOL
+               and type(message) == "table"
+               and message.action == "ack"
+               and message.floorKey == floorKey then
                 return true
             else
+                -- Not our ack — put it back so the main loop can handle it
+                -- (e.g. another floor requesting THIS floor simultaneously).
                 os.queueEvent(event, p1, p2, p3)
             end
         elseif event == "timer" and p1 == timer then
@@ -251,21 +303,22 @@ local function requestFloor(floorId)
     end
 end
 
---========== DRAWING ==========--
+--====================================================--
+--   DRAWING
+--====================================================--
 
 local function setStatus(text, color, holdSeconds)
     statusMessage = text
-    statusColor = color
+    statusColor   = color
     statusClearAt = os.clock() + (holdSeconds or 2.5)
 end
 
--- Centers text inside a rectangular region, both horizontally and vertically.
 local function fillButton(text, bg, fg, xmin, xmax, ymin, ymax)
     mon.setBackgroundColor(bg)
     mon.setTextColor(fg)
-    local width = xmax - xmin + 1
-    local height = ymax - ymin + 1
-    local textY = ymin + math.floor((height - 1) / 2)
+    local width   = xmax - xmin + 1
+    local height  = ymax - ymin + 1
+    local textY   = ymin + math.floor((height - 1) / 2)
     local leftPad = math.floor((width - #text) / 2)
     local rightPad = width - #text - leftPad
     for y = ymin, ymax do
@@ -282,31 +335,31 @@ end
 
 local function drawButtons()
     buttonRegions = {}
-
-    local gap = 1
-    local totalGap = gap * (#BUTTONS - 1)
-    local usableHeight = H - totalGap
-    local rowHeight = math.floor(usableHeight / #BUTTONS)
-    local leftover = usableHeight - (rowHeight * #BUTTONS)
+    local gap        = 1
+    local totalGap   = gap * (#BUTTONS - 1)
+    local usable     = H - totalGap
+    local rowHeight  = math.floor(usable / #BUTTONS)
+    local leftover   = usable - (rowHeight * #BUTTONS)
 
     local y = 1
     for i, btn in ipairs(BUTTONS) do
-        -- distribute any leftover rows to the first buttons so the set
-        -- of buttons always fills exactly 100% of the monitor height
         local thisHeight = rowHeight + ((i <= leftover) and 1 or 0)
         local ymin = y
         local ymax = y + thisHeight - 1
 
+        local isThisFloor = (btn.floorKey == MY_FLOOR_KEY)
         local bg, fg
         if i == selectedIndex then
             bg, fg = THEME.btnSelectedBg, THEME.btnSelectedText
+        elseif isThisFloor then
+            -- Subtly mark the button for the floor we're currently on.
+            bg, fg = colors.lightGray, colors.black
         else
             bg, fg = THEME.btnBg, THEME.btnText
         end
 
         fillButton(btn.label, bg, fg, 1, W, ymin, ymax)
         buttonRegions[i] = { xmin = 1, xmax = W, ymin = ymin, ymax = ymax }
-
         y = ymax + 1 + gap
     end
 end
@@ -316,8 +369,6 @@ local function drawScreen()
     mon.clear()
     drawButtons()
 
-    -- transient status message overlays the bottom row of the last button
-    -- briefly, then clears itself on the next redraw once expired.
     if statusMessage and os.clock() < statusClearAt then
         local lastBtn = buttonRegions[#BUTTONS]
         mon.setBackgroundColor(THEME.bg)
@@ -328,11 +379,14 @@ local function drawScreen()
     end
 end
 
---========== INPUT HANDLING ==========--
+--====================================================--
+--   INPUT HANDLING
+--====================================================--
 
 local function handleMonitorTouch(x, y)
     for i, region in pairs(buttonRegions) do
-        if x >= region.xmin and x <= region.xmax and y >= region.ymin and y <= region.ymax then
+        if x >= region.xmin and x <= region.xmax
+           and y >= region.ymin and y <= region.ymax then
             selectedIndex = i
             drawScreen()
             return
@@ -341,7 +395,20 @@ local function handleMonitorTouch(x, y)
 end
 
 local function handlePlayerClick(username)
-    local btn = selectedIndex and BUTTONS[selectedIndex] or DEFAULT_FLOOR
+    local btn
+    if selectedIndex then
+        btn = BUTTONS[selectedIndex]
+    else
+        -- Find the DEFAULT_FLOOR_KEY button in the BUTTONS list.
+        for _, b in ipairs(BUTTONS) do
+            if b.floorKey == DEFAULT_FLOOR_KEY then btn = b break end
+        end
+        -- Fallback: synthesise an entry so the logic below still works.
+        if not btn then
+            btn = { label = DEFAULT_FLOOR_KEY, requiredRank = 1, floorKey = DEFAULT_FLOOR_KEY }
+        end
+    end
+
     local rank = getRank(username)
 
     if rank < btn.requiredRank then
@@ -350,21 +417,43 @@ local function handlePlayerClick(username)
         return
     end
 
-    setStatus(username .. ": Access granted", THEME.msgGood, 2)
+    setStatus(username .. ": Granted", THEME.msgGood, 1.5)
     drawScreen()
 
-    local ok = requestFloor(btn.floorId)
+    local ok = requestFloor(btn.floorKey)
 
     if ok then
-        setStatus("Moving to " .. btn.label, THEME.msgGood, 2.5)
+        setStatus("Moving -> " .. btn.label, THEME.msgGood, 2.5)
     else
-        setStatus("No response from receiver!", THEME.msgBad, 3)
+        setStatus("No response!", THEME.msgBad, 3)
     end
     selectedIndex = nil
     drawScreen()
 end
 
---========== MAIN LOOP ==========--
+-- Called when this computer receives a floor request FROM another panel.
+local function handleIncomingRequest(senderId, message)
+    local floorKey = message.floorKey
+    if not FLOORS[floorKey] then
+        print("Ignoring unknown floorKey: " .. tostring(floorKey))
+        return
+    end
+    -- Only act if the request is actually for THIS floor.
+    if FLOOR_COMPUTERS[floorKey] ~= MY_ID then
+        print("Request for '" .. floorKey .. "' arrived here but target ID is "
+              .. tostring(FLOOR_COMPUTERS[floorKey]) .. " -- ignoring.")
+        return
+    end
+    print("Floor request from #" .. tostring(senderId) .. " -> " .. floorKey)
+    rednet.send(senderId, { action = "ack", floorKey = floorKey }, PROTOCOL)
+    -- Pulse redstone AFTER sending the ack so the panel's timer doesn't
+    -- expire before we confirm; the physical mechanism fires right after.
+    pulseRedstone(floorKey)
+end
+
+--====================================================--
+--   MAIN LOOP
+--====================================================--
 
 local function main()
     refreshRankCache()
@@ -374,13 +463,28 @@ local function main()
 
     while true do
         local event, p1, p2, p3 = os.pullEvent()
+
         if event == "monitor_touch" then
+            -- p1 = monitor name, p2 = x, p3 = y
             handleMonitorTouch(p2, p3)
+
         elseif event == "playerClick" then
-            -- playerClick fires with (username, devicename)
+            -- p1 = username, p2 = device name
             handlePlayerClick(p1)
+
+        elseif event == "rednet_message" then
+            -- p1 = senderId, p2 = message table, p3 = protocol string
+            local senderId, message, protocol = p1, p2, p3
+            if protocol == PROTOCOL
+               and type(message) == "table"
+               and message.action == "goToFloor" then
+                handleIncomingRequest(senderId, message)
+            end
+            -- Acks from remote floors while waiting in requestFloor() are
+            -- consumed inside that function; if one leaks here it's stale
+            -- and safe to drop.
+
         elseif event == "timer" and p1 == statusTimer then
-            -- redraw periodically so expired status messages clear themselves
             if statusMessage and os.clock() >= statusClearAt then
                 statusMessage = nil
                 drawScreen()
@@ -390,16 +494,12 @@ local function main()
     end
 end
 
--- Watchdog: if anything inside main() throws (a momentary HTTP hiccup, a
--- dropped peripheral, etc), log it and restart main() after a short pause
--- instead of leaving the panel dead until someone notices and reruns it.
--- Combined with copying this file to /startup.lua, the panel comes back on
--- its own after a server restart AND after any in-game crash.
+--====================================================--
+--   WATCHDOG  (auto-restart on crash)
+--====================================================--
 while true do
     local ok, err = pcall(main)
-    if ok then
-        break -- main() returned normally (shouldn't happen, but don't loop forever if it does)
-    end
+    if ok then break end
     print("Elevator panel crashed: " .. tostring(err))
     print("Restarting in 3 seconds...")
     sleep(3)
