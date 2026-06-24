@@ -25,7 +25,7 @@ end
 --   Channel Settings -> Integrations -> Webhooks -> New Webhook -> Copy Webhook URL
 -- NOTE: this computer needs HTTP enabled, and "discord.com" must be allowed
 -- in the server's CC: Tweaked config (http.rules) or this will fail to connect.
-local WEBHOOK_URL = "https://discord.com/api/webhooks/PUT_YOUR_WEBHOOK_ID/PUT_YOUR_WEBHOOK_TOKEN"
+local WEBHOOK_URL = "https://discord.com/api/webhooks/1519150777174724640/5RcOy3OPeehsFBw1wgHhxgszeLRkIKDufW4sg64QCe1kLHqYuR5nOv4JRTO8xZPd8mhF"
 
 -- The message ID gets cached here on disk so we know which Discord message
 -- to edit. This file holds ONLY an id (no rank data) -- ranks themselves
