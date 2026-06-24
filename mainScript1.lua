@@ -224,9 +224,10 @@ local lastWarned = {}   -- [username] = os.clock() of last warning sent
 
 local function sendWarning(username)
     if not chatBox then return end
-    -- Advanced Peripherals Chat Box API: sendMessageToPlayer(message, username, sender, prefix)
+    -- Correct Advanced Peripherals API signature:
+    -- sendMessageToPlayer(message, username, prefix, brackets, bracketColor)
     local ok, err = pcall(function()
-        chatBox.sendMessageToPlayer(WARN_MESSAGE, username, WARN_SENDER, WARN_PREFIX)
+        chatBox.sendMessageToPlayer(WARN_MESSAGE, username, WARN_SENDER, "[]", "&c")
     end)
     if not ok then
         print("[ChatBox] Failed to warn " .. username .. ": " .. tostring(err))
@@ -317,32 +318,46 @@ local function httpPost(url, payload, headers)
 end
 
 -- Returns body, success, status.
--- Uses os.pullEventRaw so http_success/http_failure are not filtered out.
+-- Uses http.post with method override via a raw request, then waits with
+-- os.pullEventRaw so http_success/http_failure are not filtered out.
+-- Unrelated http events are safely ignored (not re-queued — handles can't
+-- be serialised back into the event queue).
 local function httpPatch(url, payload, headers)
     headers = headers or {}
     headers["Content-Type"] = "application/json"
-    local sentOk = pcall(function()
+    local sentOk, sentErr = pcall(function()
         http.request({ url = url, body = payload, headers = headers, method = "PATCH" })
     end)
     if not sentOk then
+        print("[HTTP] PATCH send error: " .. tostring(sentErr))
         return nil, false, "request_failed"
     end
-    while true do
+    -- Wait for the response, ignoring unrelated events.
+    -- We do NOT re-queue http handles because they can't be re-queued safely.
+    local deadline = os.clock() + 10  -- 10 second timeout
+    while os.clock() < deadline do
         local event, evUrl, handle = os.pullEventRaw()
         if event == "terminate" then
             error("Terminated", 0)
-        elseif event == "http_success" and evUrl == url then
-            local body   = handle.readAll()
-            local status = handle.getResponseCode()
-            handle.close()
-            return body, (status >= 200 and status < 300), status
-        elseif event == "http_failure" and evUrl == url then
-            return nil, false, "http_failure"
-        else
-            -- Not our response — put it back and keep waiting
-            os.queueEvent(event, evUrl, handle)
+        elseif event == "http_success" then
+            if evUrl == url then
+                local body   = handle.readAll()
+                local status = handle.getResponseCode()
+                handle.close()
+                return body, (status >= 200 and status < 300), status
+            else
+                -- Different URL succeeded — close handle to avoid leak, keep waiting
+                if handle then pcall(function() handle.close() end) end
+            end
+        elseif event == "http_failure" then
+            if evUrl == url then
+                return nil, false, "http_failure"
+            end
+            -- Different URL failed — keep waiting
         end
+        -- All other events are silently ignored while we wait for our HTTP response
     end
+    return nil, false, "timeout"
 end
 
 local function httpGet(url, headers)
