@@ -88,7 +88,7 @@ local PROTOCOL = "elevator_v1"
 
 --========== DISCORD RANK CONFIG ==========--
 local WEBHOOK_URL    = "https://discord.com/api/webhooks/1519150777174724640/5RcOy3OPeehsFBw1wgHhxgszeLRkIKDufW4sg64QCe1kLHqYuR5nOv4JRTO8xZPd8mhF"
-local MSG_ID_FILE    = "/disc_whitelist_msg_id.txt"
+local MESSAGE_ID     = "1519151496346730529"   -- <-- paste the rank message ID here
 local RANK_CACHE_SEC = 15   -- seconds before re-fetching rank data
 
 --========== RANK DEFINITIONS ==========--
@@ -175,16 +175,6 @@ local buttonRegions  = {}      -- clickable regions for monitor_touch
 --   DISCORD RANK LOOKUP
 --====================================================--
 
-local function getCachedMessageId()
-    if not fs.exists(MSG_ID_FILE) then return nil end
-    local h = fs.open(MSG_ID_FILE, "r")
-    if not h then return nil end
-    local id = h.readAll()
-    h.close()
-    id = id and id:gsub("%s+", "") or nil
-    return (id ~= "") and id or nil
-end
-
 local function parseRanksFromDescription(description)
     local data = {}
     if not description then return data end
@@ -218,13 +208,12 @@ local function waitForHttp(url)
 end
 
 local function refreshRankCache()
-    local msgId = getCachedMessageId()
-    if not msgId then
-        print("[Ranks] No message ID file found at " .. MSG_ID_FILE)
+    if MESSAGE_ID == "PASTE_YOUR_MESSAGE_ID_HERE" then
+        print("[Ranks] ERROR: MESSAGE_ID has not been set in the script!")
         return false
     end
 
-    local getUrl = WEBHOOK_URL .. "/messages/" .. msgId
+    local getUrl = WEBHOOK_URL .. "/messages/" .. MESSAGE_ID
     print("[Ranks] Fetching rank data from Discord...")
 
     local ok, err = pcall(http.request, { url = getUrl, method = "GET" })
