@@ -96,8 +96,8 @@ local RANK_CACHE_SECONDS = 15
 
 local BUTTONS = {
     { label = "TUNNEL",   requiredRank = 3, receiverId = RECEIVER_IDS.tunnel },
-    { label = "TESTING",  requiredRank = 4, receiverId = RECEIVER_IDS.testingFloor },
-    { label = "4TH FLR",  requiredRank = 4, receiverId = RECEIVER_IDS.fourthFloor },
+    { label = "STORAGE",  requiredRank = 3, receiverId = RECEIVER_IDS.testingFloor },
+    { label = "TESTING",  requiredRank = 4, receiverId = RECEIVER_IDS.fourthFloor },
     { label = "COMMAND",  requiredRank = 5, receiverId = RECEIVER_IDS.commandFloor },
 }
 
