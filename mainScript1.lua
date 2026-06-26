@@ -1,4 +1,4 @@
--- ============================================================
+-- ============================================================v5
 --  Player Coordinate Tracker → Monitor + Discord Webhook
 --  Persistent offline player state stored IN the Discord message.
 --  On restart, parses the last message to restore offline players.
@@ -357,7 +357,9 @@ local function httpPatch(url, payload, headers)
         end
         -- All other events are silently ignored while we wait for our HTTP response
     end
-    return nil, false, "timeout"
+    print("[FATAL] HTTP PATCH timed out — rebooting now...")
+    sleep(1)
+    os.reboot()
 end
 
 local function httpGet(url, headers)
@@ -543,24 +545,29 @@ local function sendInitialMessage(content)
     local payload = textutils.serialiseJSON({ username = BOT_USERNAME, content = content })
     local body, success, status = httpPost(WEBHOOK_URL .. "?wait=true", payload)
     if not success then
-        error("Failed to post initial message. HTTP " .. tostring(status) .. ": " .. tostring(body), 0)
+        print("[FATAL] Failed to post initial message (HTTP " .. tostring(status) .. ") — rebooting now...")
+        sleep(1)
+        os.reboot()
     end
     local msg = textutils.unserialiseJSON(body)
     if not msg or not msg.id then
-        error("No message ID returned: " .. tostring(body), 0)
+        print("[FATAL] No message ID returned — rebooting now...")
+        sleep(1)
+        os.reboot()
     end
     return msg.id
 end
 
--- Returns true on success, false on failure (logs but does NOT reboot —
--- a transient Discord hiccup shouldn't kill the whole tracker).
+-- Edits the Discord message. Reboots immediately on any failure so the
+-- computer comes back fresh and re-establishes the connection.
 local function editMessage(messageId, content)
     local editUrl = WEBHOOK_URL .. "/messages/" .. messageId
     local payload = textutils.serialiseJSON({ content = content })
     local _, success, status = httpPatch(editUrl, payload)
     if not success then
-        print("[WARN] Discord edit failed (" .. tostring(status) .. ") — will retry next cycle.")
-        return false
+        print("[FATAL] Discord edit failed (" .. tostring(status) .. ") — rebooting now...")
+        sleep(1)
+        os.reboot()
     end
     return true
 end
@@ -569,8 +576,9 @@ local function fetchMessage(messageId)
     local url  = WEBHOOK_URL .. "/messages/" .. messageId
     local body, success, status = httpGet(url)
     if not success then
-        print("[WARN] Could not fetch message (HTTP " .. tostring(status) .. ")")
-        return nil
+        print("[FATAL] Could not fetch message (HTTP " .. tostring(status) .. ") — rebooting now...")
+        sleep(1)
+        os.reboot()
     end
     local msg = textutils.unserialiseJSON(body)
     return msg and msg.content or nil
@@ -642,7 +650,8 @@ while true do
         print("[" .. os.time() .. "] Updated — " .. on .. " online, " .. off .. " offline")
     else
         print("[ERROR] " .. tostring(err))
-        print("Continuing after error...")
-        sleep(1)
+        print("Rebooting in 2 seconds...")
+        sleep(2)
+        os.reboot()
     end
 end
