@@ -1,4 +1,4 @@
--- ============================================================v5
+-- ============================================================v6
 --  Player Coordinate Tracker → Monitor + Discord Webhook
 --  Persistent offline player state stored IN the Discord message.
 --  On restart, parses the last message to restore offline players.
@@ -16,7 +16,7 @@
 -- ============================================================
 
 local WEBHOOK_URL     = "https://discord.com/api/webhooks/1518852807694880818/tJ4d23Ba01Mc1ZekjK5yhSiLykKoKofQ2EFskPzR2rT15U8nPDhYLTNUfLm5u6a2othY"
-local UPDATE_INTERVAL = 0
+local UPDATE_INTERVAL = 5   -- seconds between Discord updates (0 causes rate limiting)
 local BOT_USERNAME    = "Player Tracker"
 local ID_FILE         = "tracker_message_id.txt"
 
@@ -317,14 +317,19 @@ local function httpPost(url, payload, headers)
     return body, (status >= 200 and status < 300), status
 end
 
+-- Sends a PATCH request synchronously using parallel.waitForAny so the
+-- timeout genuinely interrupts the wait even if no http event ever fires.
 -- Returns body, success, status.
--- Uses http.post with method override via a raw request, then waits with
--- os.pullEventRaw so http_success/http_failure are not filtered out.
--- Unrelated http events are safely ignored (not re-queued — handles can't
--- be serialised back into the event queue).
 local function httpPatch(url, payload, headers)
     headers = headers or {}
     headers["Content-Type"] = "application/json"
+
+    local resultBody    = nil
+    local resultSuccess = false
+    local resultStatus  = "no_response"
+    local done          = false
+
+    -- Fire the async request
     local sentOk, sentErr = pcall(function()
         http.request({ url = url, body = payload, headers = headers, method = "PATCH" })
     end)
@@ -332,34 +337,47 @@ local function httpPatch(url, payload, headers)
         print("[HTTP] PATCH send error: " .. tostring(sentErr))
         return nil, false, "request_failed"
     end
-    -- Wait for the response, ignoring unrelated events.
-    -- We do NOT re-queue http handles because they can't be re-queued safely.
-    local deadline = os.clock() + 10  -- 10 second timeout
-    while os.clock() < deadline do
-        local event, evUrl, handle = os.pullEventRaw()
-        if event == "terminate" then
-            error("Terminated", 0)
-        elseif event == "http_success" then
-            if evUrl == url then
-                local body   = handle.readAll()
-                local status = handle.getResponseCode()
-                handle.close()
-                return body, (status >= 200 and status < 300), status
-            else
-                -- Different URL succeeded — close handle to avoid leak, keep waiting
-                if handle then pcall(function() handle.close() end) end
+
+    -- Wait for a response, with a hard 10-second timeout via parallel
+    parallel.waitForAny(
+        -- Coroutine 1: listen for the HTTP response
+        function()
+            while true do
+                local event, evUrl, handle = os.pullEventRaw()
+                if event == "terminate" then
+                    error("Terminated", 0)
+                elseif event == "http_success" and evUrl == url then
+                    resultBody    = handle.readAll()
+                    resultStatus  = handle.getResponseCode()
+                    resultSuccess = (resultStatus >= 200 and resultStatus < 300)
+                    handle.close()
+                    done = true
+                    return
+                elseif event == "http_failure" and evUrl == url then
+                    resultStatus  = "http_failure"
+                    resultSuccess = false
+                    done = true
+                    return
+                elseif event == "http_success" or event == "http_failure" then
+                    -- Unrelated URL — close handle if present to avoid leak
+                    if handle then pcall(function() handle.close() end) end
+                end
             end
-        elseif event == "http_failure" then
-            if evUrl == url then
-                return nil, false, "http_failure"
-            end
-            -- Different URL failed — keep waiting
+        end,
+        -- Coroutine 2: hard timeout
+        function()
+            sleep(10)
         end
-        -- All other events are silently ignored while we wait for our HTTP response
+    )
+
+    if not done then
+        -- Timeout coroutine won the race
+        print("[FATAL] HTTP PATCH timed out — rebooting now...")
+        sleep(1)
+        os.reboot()
     end
-    print("[FATAL] HTTP PATCH timed out — rebooting now...")
-    sleep(1)
-    os.reboot()
+
+    return resultBody, resultSuccess, resultStatus
 end
 
 local function httpGet(url, headers)
