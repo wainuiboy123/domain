@@ -1,4 +1,4 @@
--- ============================================================v6
+-- ============================================================v7
 --  Player Coordinate Tracker → Monitor + Discord Webhook
 --  Persistent offline player state stored IN the Discord message.
 --  On restart, parses the last message to restore offline players.
@@ -576,13 +576,24 @@ local function sendInitialMessage(content)
     return msg.id
 end
 
--- Edits the Discord message. Reboots immediately on any failure so the
--- computer comes back fresh and re-establishes the connection.
+-- Edits the Discord message. On 404 (message deleted) posts a new one.
+-- On genuine network failure, reboots so we come back fresh.
 local function editMessage(messageId, content)
     local editUrl = WEBHOOK_URL .. "/messages/" .. messageId
     local payload = textutils.serialiseJSON({ content = content })
     local _, success, status = httpPatch(editUrl, payload)
     if not success then
+        if status == 404 or status == 400 then
+            -- Message was deleted — post a new one and save its ID
+            print("[WARN] Edit target gone (HTTP " .. tostring(status) .. ") — posting new message...")
+            if fs.exists(ID_FILE) then fs.delete(ID_FILE) end
+            local newId = sendInitialMessage(content)
+            saveMessageId(newId)
+            -- Update the upvalue so the main loop uses the new ID going forward
+            messageId = newId
+            print("[INFO] New message posted, ID: " .. newId)
+            return true
+        end
         print("[FATAL] Discord edit failed (" .. tostring(status) .. ") — rebooting now...")
         sleep(1)
         os.reboot()
@@ -594,6 +605,13 @@ local function fetchMessage(messageId)
     local url  = WEBHOOK_URL .. "/messages/" .. messageId
     local body, success, status = httpGet(url)
     if not success then
+        if status == 404 or status == 400 then
+            -- Message was deleted on Discord — wipe the saved ID so we post fresh
+            print("[WARN] Message " .. messageId .. " not found (HTTP " .. tostring(status) .. ") — will create a new one.")
+            if fs.exists(ID_FILE) then fs.delete(ID_FILE) end
+            return nil
+        end
+        -- Genuine network failure — reboot and try again
         print("[FATAL] Could not fetch message (HTTP " .. tostring(status) .. ") — rebooting now...")
         sleep(1)
         os.reboot()
@@ -650,26 +668,119 @@ end
 
 print("Running — Ctrl+T to stop.")
 print("")
+print("Console commands:")
+print("  add <name> <x> <y> <z> [dimension]  — manually add offline player")
+print("  remove <name>                        — remove an offline player entry")
+print("  list                                 — list all offline players")
+print("")
+
+-- ════════════════════════════════════════════════════════════
+--  CONSOLE COMMAND HANDLER
+-- ════════════════════════════════════════════════════════════
+local function handleCommand(line)
+    line = line:match("^%s*(.-)%s*$")  -- trim whitespace
+    if line == "" then return end
+
+    local parts = {}
+    for word in line:gmatch("%S+") do
+        table.insert(parts, word)
+    end
+    local cmd = parts[1] and parts[1]:lower() or ""
+
+    if cmd == "add" then
+        local name = parts[2]
+        local x    = tonumber(parts[3])
+        local y    = tonumber(parts[4])
+        local z    = tonumber(parts[5])
+        local dim  = parts[6] or "minecraft:overworld"
+        if not (name and x and y and z) then
+            print("[CMD] Usage: add <name> <x> <y> <z> [dimension]")
+            return
+        end
+        offlinePlayers[name] = {
+            x        = x,
+            y        = y,
+            z        = z,
+            dimension = dim,
+            distance  = distance3D(x, y, z),
+            lastSeen  = os.date and os.date("!%H:%M:%S") or "manual",
+        }
+        print("[CMD] Added offline entry: " .. name
+            .. " @ " .. x .. ", " .. y .. ", " .. z
+            .. " (" .. dim .. ")")
+
+    elseif cmd == "remove" then
+        local name = parts[2]
+        if not name then
+            print("[CMD] Usage: remove <name>")
+            return
+        end
+        if offlinePlayers[name] then
+            offlinePlayers[name] = nil
+            print("[CMD] Removed offline entry for " .. name)
+        else
+            print("[CMD] No offline entry found for " .. name)
+        end
+
+    elseif cmd == "list" then
+        local count = 0
+        for name, data in pairs(offlinePlayers) do
+            print(string.format("  %-16s  %.1f, %.1f, %.1f  (%s)",
+                name, data.x, data.y, data.z, data.dimension or "unknown"))
+            count = count + 1
+        end
+        if count == 0 then
+            print("  (no offline entries)")
+        end
+
+    else
+        print("[CMD] Unknown command: " .. cmd)
+        print("  add <name> <x> <y> <z> [dimension]")
+        print("  remove <name>")
+        print("  list")
+    end
+end
 
 -- ════════════════════════════════════════════════════════════
 --  MAIN LOOP
 -- ════════════════════════════════════════════════════════════
+-- Runs two things in parallel: the update ticker and the console input reader.
+-- This way typing in the console doesn't block updates, and updates don't
+-- swallow your keystrokes.
+
+local updateTimer = os.startTimer(UPDATE_INTERVAL)
+
 while true do
-    sleep(UPDATE_INTERVAL)
-    local ok2, err = pcall(function()
-        updatePlayerState()
-        checkProximityWarnings()
-        renderMonitor()
-        editMessage(messageId, buildDiscordContent())
-    end)
-    if ok2 then
-        local on  = 0; for _ in pairs(onlinePlayers)  do on  = on  + 1 end
-        local off = 0; for _ in pairs(offlinePlayers) do off = off + 1 end
-        print("[" .. os.time() .. "] Updated — " .. on .. " online, " .. off .. " offline")
-    else
-        print("[ERROR] " .. tostring(err))
-        print("Rebooting in 2 seconds...")
-        sleep(2)
-        os.reboot()
+    local event, p1, p2, p3 = os.pullEvent()
+
+    if event == "timer" and p1 == updateTimer then
+        local ok2, err = pcall(function()
+            updatePlayerState()
+            checkProximityWarnings()
+            renderMonitor()
+            editMessage(messageId, buildDiscordContent())
+        end)
+        if ok2 then
+            local on  = 0; for _ in pairs(onlinePlayers)  do on  = on  + 1 end
+            local off = 0; for _ in pairs(offlinePlayers) do off = off + 1 end
+            print("[" .. os.time() .. "] Updated — " .. on .. " online, " .. off .. " offline")
+        else
+            print("[ERROR] " .. tostring(err))
+            print("Rebooting in 2 seconds...")
+            sleep(2)
+            os.reboot()
+        end
+        updateTimer = os.startTimer(UPDATE_INTERVAL)
+
+    elseif event == "char" or event == "key" then
+        -- Let term.read() handle a full line when the user starts typing.
+        -- We intercept the first char/key, then hand off to a read() call.
+        -- To do this cleanly, re-queue the event so read() sees it.
+        os.queueEvent(event, p1, p2, p3)
+        io.write("> ")
+        local line = io.read()
+        if line then
+            handleCommand(line)
+        end
     end
 end
