@@ -1,4 +1,4 @@
---====================================================--
+--====================================================V6
 --   ELEVATOR FLOOR PANEL  (unified panel + receiver)
 --   For CC: Tweaked + Advanced Peripherals
 --
@@ -88,7 +88,7 @@ local PROTOCOL = "elevator_v1"
 
 --========== DISCORD RANK CONFIG ==========--
 local WEBHOOK_URL    = "https://discord.com/api/webhooks/1519150777174724640/5RcOy3OPeehsFBw1wgHhxgszeLRkIKDufW4sg64QCe1kLHqYuR5nOv4JRTO8xZPd8mhF"
-local MESSAGE_ID     = "1519151496346730529"   -- <-- paste the rank message ID here
+local MESSAGE_ID     = "1519151496346730529"
 local RANK_CACHE_SEC = 15   -- seconds before re-fetching rank data
 
 --========== RANK DEFINITIONS ==========--
@@ -192,70 +192,100 @@ local function parseRanksFromDescription(description)
     return data
 end
 
--- Async-safe HTTP wait: uses os.pullEventRaw (not os.pullEvent) so that
--- http_success / http_failure events are NOT silently filtered out.
--- Unrelated events are re-queued so nothing else is lost.
-local function waitForHttp(url)
-    while true do
-        local event, evUrl, p3, p4 = os.pullEventRaw()
-        if (event == "http_success" or event == "http_failure") and evUrl == url then
-            return event, p3, p4
-        else
-            os.queueEvent(event, evUrl, p3, p4)
-            os.sleep(0)
-        end
-    end
-end
-
+-- Fetches rank data from Discord with a hard 3-second timeout.
+-- Uses parallel.waitForAny so the timeout genuinely interrupts the wait
+-- even if the connection drops silently with no http event.
+-- Reboots the computer on any failure so it retries from scratch.
 local function refreshRankCache()
-    if MESSAGE_ID == "PASTE_YOUR_MESSAGE_ID_HERE" then
-        print("[Ranks] ERROR: MESSAGE_ID has not been set in the script!")
-        return false
-    end
-
     local getUrl = WEBHOOK_URL .. "/messages/" .. MESSAGE_ID
     print("[Ranks] Fetching rank data from Discord...")
 
-    local ok, err = pcall(http.request, { url = getUrl, method = "GET" })
-    if not ok then
-        print("[Ranks] http.request failed: " .. tostring(err))
-        return false
+    local sentOk, sentErr = pcall(function()
+        http.request({ url = getUrl, method = "GET" })
+    end)
+    if not sentOk then
+        print("[Ranks] Failed to send request: " .. tostring(sentErr))
+        print("[Ranks] Rebooting in 2s...")
+        sleep(2)
+        os.reboot()
     end
 
-    local event, handle, errMsg = waitForHttp(getUrl)
-    if event == "http_failure" then
-        print("[Ranks] HTTP request failed: " .. tostring(errMsg))
-        return false
+    local resultEvent  = nil
+    local resultHandle = nil
+
+    parallel.waitForAny(
+        function()
+            while true do
+                local event, evUrl, handle = os.pullEventRaw()
+                if event == "terminate" then
+                    error("Terminated", 0)
+                elseif event == "http_success" and evUrl == getUrl then
+                    resultEvent  = "success"
+                    resultHandle = handle
+                    return
+                elseif event == "http_failure" and evUrl == getUrl then
+                    resultEvent = "failure"
+                    return
+                elseif event == "http_success" or event == "http_failure" then
+                    if handle then pcall(function() handle.close() end) end
+                end
+            end
+        end,
+        function()
+            sleep(3)
+        end
+    )
+
+    if resultEvent == nil then
+        print("[Ranks] Timed out after 3s — rebooting...")
+        sleep(1)
+        os.reboot()
     end
 
-    local body = handle.readAll()
-    handle.close()
+    if resultEvent == "failure" then
+        print("[Ranks] HTTP request failed — rebooting...")
+        sleep(1)
+        os.reboot()
+    end
+
+    local body   = resultHandle.readAll()
+    local status = resultHandle.getResponseCode()
+    resultHandle.close()
+
+    if status ~= 200 then
+        print("[Ranks] Bad HTTP status " .. status .. " — rebooting...")
+        sleep(1)
+        os.reboot()
+    end
 
     local parsed = textutils.unserialiseJSON(body)
-    if not parsed then
-        print("[Ranks] Failed to parse JSON response")
-        return false
-    end
-    if not (parsed.embeds and parsed.embeds[1]) then
-        print("[Ranks] No embeds found in Discord message")
-        return false
+    if not parsed or not (parsed.embeds and parsed.embeds[1]) then
+        print("[Ranks] Could not parse Discord response — rebooting...")
+        sleep(1)
+        os.reboot()
     end
 
-    local newCache = parseRanksFromDescription(parsed.embeds[1].description)
+    local desc = parsed.embeds[1].description or ""
+    local newCache = parseRanksFromDescription(desc)
     local count = 0
-    for _ in pairs(newCache) do count = count + 1 end
+    for k, v in pairs(newCache) do
+        count = count + 1
+        print("[Ranks]   " .. k .. " = " .. tostring(v))
+    end
 
     if count == 0 then
-        print("[Ranks] WARNING: Parsed 0 ranks. Check the embed description format.")
-        print("[Ranks] Description preview: " .. tostring(parsed.embeds[1].description or "nil"):sub(1, 120))
+        print("[Ranks] WARNING: Parsed 0 ranks!")
+        print("[Ranks] Raw description (first 300 chars):")
+        print(desc:sub(1, 300))
     else
-        print("[Ranks] Loaded " .. count .. " rank entries.")
+        print("[Ranks] Loaded " .. count .. " rank entries OK.")
     end
 
     rankCache     = newCache
     rankCacheTime = os.clock()
     return true
 end
+
 
 local function getRank(username)
     if os.clock() - rankCacheTime > RANK_CACHE_SEC then
