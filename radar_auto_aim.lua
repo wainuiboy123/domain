@@ -1,4 +1,4 @@
---====================================================--v2
+--====================================================--v3
 --   RADAR TRACKER
 --   CC: Tweaked + Advanced Peripherals + Create
 --
@@ -50,7 +50,6 @@ local RADAR_Z = -60
 -- Range (metres) to search for players.
 -- Advanced Peripherals player_detector max is typically 100000.
 local DETECT_RANGE = 1000
-
 --========== DERIVED CONSTANTS ==========--
 
 -- Degrees per second the bearing rotates at BEARING_RPM.
@@ -63,26 +62,6 @@ local detector = peripheral.find("player_detector")
 if not detector then
     error("No player_detector found! Attach one to this computer.", 0)
 end
-
-print("=== Radar Tracker ===")
-print("Detector  : " .. peripheral.getName(detector))
-print("Radar pos : " .. RADAR_X .. ", " .. RADAR_Y .. ", " .. RADAR_Z)
-print("RPM       : " .. BEARING_RPM .. " (" .. DEG_PER_SEC .. " deg/s)")
-print("Tolerance : " .. TOLERANCE_DEG .. " deg")
-print("")
-print("Ensure radar is facing NORTH (0 deg) before starting.")
-print("Enabling clutch so radar becomes a physics object...")
-print("Press any key when ready to begin tracking...")
-
--- Engage clutch now so the bearing becomes a moveable physics object
--- while you manually rotate the radar to face North.
-setClutch(true)
-setGearshift(false)
-
-os.pullEvent("key")
-
--- Disengage until tracking starts
-setClutch(false)
 
 --========== STATE ==========--
 
@@ -134,6 +113,26 @@ local function cleanup()
     -- Make sure gearshift is in a neutral state
     setGearshift(false)
 end
+
+print("=== Radar Tracker ===")
+print("Detector  : " .. peripheral.getName(detector))
+print("Radar pos : " .. RADAR_X .. ", " .. RADAR_Y .. ", " .. RADAR_Z)
+print("RPM       : " .. BEARING_RPM .. " (" .. DEG_PER_SEC .. " deg/s)")
+print("Tolerance : " .. TOLERANCE_DEG .. " deg")
+print("")
+print("Ensure radar is facing NORTH (0 deg) before starting.")
+print("Enabling clutch so radar becomes a physics object...")
+print("Press any key when ready to begin tracking...")
+
+-- Engage clutch now so the bearing becomes a moveable physics object
+-- while you manually rotate the radar to face North.
+setClutch(true)
+setGearshift(false)
+
+os.pullEvent("key")
+
+-- Disengage until tracking starts
+setClutch(false)
 
 --========== YAW MATH ==========--
 
