@@ -1,4 +1,4 @@
---====================================================--v1
+--====================================================--v2
 --   RADAR TRACKER
 --   CC: Tweaked + Advanced Peripherals + Create
 --
@@ -71,8 +71,18 @@ print("RPM       : " .. BEARING_RPM .. " (" .. DEG_PER_SEC .. " deg/s)")
 print("Tolerance : " .. TOLERANCE_DEG .. " deg")
 print("")
 print("Ensure radar is facing NORTH (0 deg) before starting.")
-print("Press any key to begin tracking...")
+print("Enabling clutch so radar becomes a physics object...")
+print("Press any key when ready to begin tracking...")
+
+-- Engage clutch now so the bearing becomes a moveable physics object
+-- while you manually rotate the radar to face North.
+setClutch(true)
+setGearshift(false)
+
 os.pullEvent("key")
+
+-- Disengage until tracking starts
+setClutch(false)
 
 --========== STATE ==========--
 
@@ -247,8 +257,6 @@ print("Tracking started. Ctrl+T to stop.")
 print("")
 lineCount = 0
 
--- Ensure radar starts stopped
-stopRadar()
 lastUpdateTime = os.clock()
 
 local running = true
