@@ -1,4 +1,4 @@
---====================================================--v4
+--====================================================--v5
 --   RADAR TRACKER
 --   CC: Tweaked + Advanced Peripherals + Create
 --
@@ -19,8 +19,8 @@
 
 --========== CONFIG ==========--
 
-local CLUTCH_SIDE    = "left"    -- redstone side controlling the clutch
-local GEARSHIFT_SIDE = "right"   -- redstone side controlling the gearshift
+local CLUTCH_SIDE    = "bottom"    -- redstone side controlling the clutch
+local GEARSHIFT_SIDE = "top"   -- redstone side controlling the gearshift
 
 -- RPM of the rotational system AT THE BEARING.
 -- Measure in-game with a Speedometer placed on the shaft going into the bearing.
