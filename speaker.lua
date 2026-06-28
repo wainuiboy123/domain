@@ -1,4 +1,4 @@
---====================================================--v2
+--====================================================-v3
 --   MUSIC SERVER WRAPPER
 --   Runs on computers with a Speaker + Ender Modem.
 --   Downloads the iPod script (Rc1PCzLH) automatically,
@@ -105,10 +105,18 @@ end
 -- iPod's (now-shared) state directly, then fires the events
 -- the iPod script already listens for, so its own loops pick
 -- up the change exactly as if a local button had been clicked.
+--
+-- PASSIVE BY DESIGN: this server sends NOTHING on its own. It never
+-- broadcasts and never runs on a timer. The only network traffic it
+-- ever generates is a single rednet.send() directly back to whoever
+-- just sent it a message - one reply, to one computer, only when asked.
+-- With several speaker servers on the network, none of them generate
+-- any background traffic at all, which is what was overloading the
+-- pocket computer's message queue and making its screen sluggish.
 
-local function broadcastStatus()
-    rednet.broadcast({
-        action      = "status",
+local function replyStatus(senderId, action)
+    rednet.send(senderId, {
+        action      = action or "status",
         id          = MY_ID,
         playing     = env.playing or false,
         now_playing = env.now_playing,
@@ -137,15 +145,7 @@ local function remoteListener()
             -- ignore
 
         elseif message.action == "ping" then
-            rednet.send(senderId, {
-                action      = "pong",
-                id          = MY_ID,
-                playing     = env.playing or false,
-                now_playing = env.now_playing,
-                queue       = env.queue or {},
-                looping     = env.looping or 0,
-                volume      = env.volume or 1.5,
-            }, PROTOCOL)
+            replyStatus(senderId, "pong")
 
         elseif message.action == "play" then
             -- Resume: play current now_playing, or pop from queue
@@ -164,7 +164,7 @@ local function remoteListener()
                 os.queueEvent("audio_update")
                 os.queueEvent("redraw_screen")
             end
-            broadcastStatus()
+            replyStatus(senderId)
             print("[Remote] Play")
 
         elseif message.action == "play_now" then
@@ -179,7 +179,7 @@ local function remoteListener()
                 env.is_loading  = false
                 os.queueEvent("audio_update")
                 os.queueEvent("redraw_screen")
-                broadcastStatus()
+                replyStatus(senderId)
                 print("[Remote] Play now: " .. song.name)
             end
 
@@ -190,7 +190,7 @@ local function remoteListener()
                 table.insert(env.queue, 1, song)
                 os.queueEvent("audio_update")
                 os.queueEvent("redraw_screen")
-                broadcastStatus()
+                replyStatus(senderId)
                 print("[Remote] Play next: " .. song.name)
             end
 
@@ -201,7 +201,7 @@ local function remoteListener()
                 table.insert(env.queue, song)
                 os.queueEvent("audio_update")
                 os.queueEvent("redraw_screen")
-                broadcastStatus()
+                replyStatus(senderId)
                 print("[Remote] Queue: " .. song.name)
             end
 
@@ -213,7 +213,7 @@ local function remoteListener()
             env.is_error   = false
             os.queueEvent("audio_update")
             os.queueEvent("redraw_screen")
-            broadcastStatus()
+            replyStatus(senderId)
             print("[Remote] Stop")
 
         elseif message.action == "skip" then
@@ -235,14 +235,14 @@ local function remoteListener()
             end
             os.queueEvent("audio_update")
             os.queueEvent("redraw_screen")
-            broadcastStatus()
+            replyStatus(senderId)
             print("[Remote] Skip")
 
         elseif message.action == "loop" then
             if type(message.looping) == "number" then
                 env.looping = message.looping
                 os.queueEvent("redraw_screen")
-                broadcastStatus()
+                replyStatus(senderId)
                 print("[Remote] Loop -> " .. env.looping)
             end
 
@@ -250,12 +250,12 @@ local function remoteListener()
             if type(message.volume) == "number" then
                 env.volume = math.max(0, math.min(3, message.volume))
                 os.queueEvent("redraw_screen")
-                broadcastStatus()
+                replyStatus(senderId)
                 print("[Remote] Volume -> " .. env.volume)
             end
 
         elseif message.action == "status" then
-            broadcastStatus()
+            replyStatus(senderId)
         end
     end
 end
@@ -263,20 +263,14 @@ end
 --========== PATCH + LAUNCH ==========--
 -- The iPod script ends with:  parallel.waitForAny(uiLoop, audioLoop, httpLoop)
 -- We patch env.parallel so that call also includes our remoteListener,
--- making it run as a fourth concurrent loop, and also periodically
--- broadcasts status so the remote stays in sync even without polling.
+-- making it run as a fourth concurrent loop. No timer, no periodic
+-- broadcast - this server is silent until it receives a message.
 
 local originalParallel = parallel
 env.parallel = setmetatable({}, { __index = parallel })
 env.parallel.waitForAny = function(...)
     local fns = { ... }
     table.insert(fns, remoteListener)
-    table.insert(fns, function()
-        while true do
-            sleep(2)
-            broadcastStatus()
-        end
-    end)
     return originalParallel.waitForAny(table.unpack(fns))
 end
 
