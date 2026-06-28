@@ -1,4 +1,4 @@
---====================================================--v3
+--====================================================--v4
 --   MUSIC REMOTE
 --   Runs on your Advanced Pocket Computer + Ender Modem.
 --   Mirrors the look & feel of music_server.lua, but
@@ -54,16 +54,26 @@ local volume      = 1.5
 local is_loading = false
 local is_error   = false
 
-local have_status  = false   -- have we heard from any speaker server yet?
-local linked_id     = nil    -- the ONE server ID we listen to after a scan
-local found_servers  = {}    -- id -> last pong, collected during a scan
+local have_status  = false   -- have we ever gotten a snapshot from a scan?
+local viewed_id    = nil     -- which server's data is currently shown on screen
+local found_servers = {}     -- id -> last pong, collected during a scan
 
 --========== NETWORKING ==========--
--- Commands always go out to all configured/broadcast targets (so Play/Stop/
--- etc. reach whichever server(s) you intend to control). But once `linked_id`
--- is set (via Scan), incoming STATUS/PONG messages from any OTHER id are
--- ignored - this is what stops multiple speaker servers on the network from
--- fighting over the remote's screen and flooding it with redraws.
+-- Commands always go out to ALL configured/broadcast targets - sendToSpeakers
+-- is unaffected by anything below, so Play/Stop/Skip/Volume/etc. still reach
+-- every speaker server on the network as before.
+--
+-- The remote does NOT listen to anything passively. music_server.lua still
+-- broadcasts a "status" message every few seconds from every speaker - the
+-- remote simply never has a listener running for that, so those broadcasts
+-- are never picked up and never cause a redraw. This is what removes the lag
+-- with multiple servers: the pocket computer is no longer woken up by
+-- "rednet_message" events constantly in the background.
+--
+-- The ONLY time the remote listens for anything is a deliberate, bounded
+-- window: tapping Scan broadcasts a ping and listens for exactly 1.5
+-- seconds for "pong" replies, then stops listening again. That snapshot
+-- becomes what's shown on the Now Playing tab until you scan again.
 
 local function sendToSpeakers(msg)
     if BROADCAST then
@@ -215,8 +225,8 @@ function drawNowPlaying()
     term.setCursorPos(2, 9)
     term.clearLine()
     term.setCursorPos(2, 9)
-    if linked_id then
-        term.write(" Linked: #" .. linked_id .. " (tap to rescan) ")
+    if viewed_id then
+        term.write(" Viewing #" .. viewed_id .. " (tap to rescan) ")
     else
         term.write(" Scan for speakers ")
     end
@@ -569,12 +579,11 @@ function uiLoop()
 
                             if y == 9 then
                                 -- Scan button: broadcast a ping, collect
-                                -- pongs for a short window, then either
-                                -- auto-link (1 server) or show a picker
-                                -- (2+ servers) so we settle on exactly ONE
-                                -- linked_id. This is what prevents multiple
-                                -- speaker servers from all blasting status
-                                -- updates at the remote forever.
+                                -- pongs for a short window, then stop
+                                -- listening again. This is the ONLY time
+                                -- the remote ever reads incoming rednet
+                                -- messages - the resulting snapshot is what
+                                -- Now Playing shows until the next scan.
                                 term.setBackgroundColor(colors.gray)
                                 term.setTextColor(colors.white)
                                 term.setCursorPos(2, 9)
@@ -603,10 +612,10 @@ function uiLoop()
                                 table.sort(ids)
 
                                 if #ids == 0 then
-                                    linked_id = nil
+                                    viewed_id = nil
                                 elseif #ids == 1 then
-                                    linked_id = ids[1]
-                                    local s = found_servers[linked_id]
+                                    viewed_id = ids[1]
+                                    local s = found_servers[viewed_id]
                                     have_status = true
                                     if s.now_playing ~= nil then now_playing = s.now_playing end
                                     if s.queue       ~= nil then queue       = s.queue       end
@@ -614,9 +623,9 @@ function uiLoop()
                                     if s.looping     ~= nil then looping     = s.looping     end
                                     if s.volume      ~= nil then volume      = s.volume      end
                                 else
-                                    linked_id = chooseServer(ids, found_servers)
-                                    if linked_id then
-                                        local s = found_servers[linked_id]
+                                    viewed_id = chooseServer(ids, found_servers)
+                                    if viewed_id then
+                                        local s = found_servers[viewed_id]
                                         have_status = true
                                         if s.now_playing ~= nil then now_playing = s.now_playing end
                                         if s.queue       ~= nil then queue       = s.queue       end
@@ -685,50 +694,4 @@ function httpLoop()
     end
 end
 
-function netLoop()
-    -- Listens for "status"/"pong" broadcasts from speaker servers and
-    -- mirrors state into our own (now_playing, queue, playing, looping,
-    -- volume) - the same fields drawNowPlaying() reads from.
-    --
-    -- Two things keep this from flashing/locking up the UI when multiple
-    -- speaker servers are on the network:
-    --   1. Once linked_id is set (via Scan), messages from any OTHER
-    --      server id are ignored outright - only one server's status can
-    --      drive the screen at a time.
-    --   2. redraw_screen events are throttled: if one already came in
-    --      very recently, we skip queuing another. Status updates arrive
-    --      at most every ~4s per server anyway, but this also protects
-    --      against bursts (e.g. several acks in a row after a command).
-    local last_redraw_at = 0
-    local MIN_REDRAW_GAP = 0.3   -- seconds
-
-    while true do
-        local senderId, msg, proto = rednet.receive(PROTOCOL)
-        if type(msg) == "table" and (msg.action == "status" or msg.action == "pong") then
-            if linked_id == nil or senderId == linked_id then
-                have_status = true
-                if msg.now_playing ~= nil then now_playing = msg.now_playing end
-                if msg.queue        ~= nil then queue        = msg.queue        end
-                if msg.playing      ~= nil then playing      = msg.playing      end
-                if msg.looping      ~= nil then looping      = msg.looping      end
-                if msg.volume       ~= nil then volume       = msg.volume       end
-                if msg.is_loading   ~= nil then is_loading   = msg.is_loading   end
-                if msg.is_error     ~= nil then is_error     = msg.is_error     end
-
-                local now = os.clock()
-                if now - last_redraw_at >= MIN_REDRAW_GAP then
-                    last_redraw_at = now
-                    os.queueEvent("redraw_screen")
-                end
-                -- If throttled, the state is still updated above; it will
-                -- simply be picked up by the next redraw that does fire
-                -- (e.g. the next status tick, or any user click), so
-                -- nothing is lost - we just don't repaint for every single
-                -- message when several arrive close together.
-            end
-            -- else: message from a server we're not linked to - ignored.
-        end
-    end
-end
-
-parallel.waitForAny(uiLoop, httpLoop, netLoop)
+parallel.waitForAny(uiLoop, httpLoop)
