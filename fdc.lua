@@ -1,5 +1,5 @@
 -- ==========================================
--- NODE 2: FIREMISSION DIRECTOR v19
+-- NODE 2: FIREMISSION DIRECTOR v20
 -- (Master Physics Calculator & Hub)
 -- CHANGELOG v19:
 --   - Cannons are no longer discovered by PINGing on demand. Slaves push
@@ -20,7 +20,11 @@
 
 peripheral.find("modem", function(name) rednet.open(name) end)
 
-local VELOCITY_PER_BARREL = 0.1
+-- NOTE: v18 added a `length * VELOCITY_PER_BARREL` bonus to initial shell
+-- speed here. That term was never present in the pocket client's solver
+-- (the one you validated as accurate), so carrying it over here made the
+-- FDC's math diverge from the client's by a flat +1.0 velocity per shot -
+-- consistently overshooting every cannon by the same amount. Removed.
 local SHELL_DRAG = 0.99
 local GRAVITY = 0.05
 local PITCH_MIN = -30
@@ -34,8 +38,8 @@ local lockedIds = {}      -- [id] = true, cannons that reported LOCKED for the c
 -- ==========================================
 -- PHYSICS (corrected high-arc solver)
 -- ==========================================
-local function speedForCharges(charges, tier, length)
-    return (charges * (2.0 + tier * 0.5)) + (length * VELOCITY_PER_BARREL)
+local function speedForCharges(charges, tier)
+    return charges * (2.0 + tier * 0.5)
 end
 
 -- Simulates a single shot at `pitch` and returns:
@@ -44,7 +48,7 @@ end
 --   dist   - horizontal distance covered by that time
 -- Returns nil, nil if the shell never lands at that elevation.
 local function simulateLanding(pitch, targetY, cY, charges, length, tier)
-    local initSpeed = speedForCharges(charges, tier, length)
+    local initSpeed = speedForCharges(charges, tier)
     local rad = math.rad(pitch)
     local Vw = math.cos(rad) * initSpeed
     local vy = math.sin(rad) * initSpeed
