@@ -14,22 +14,39 @@ term.setCursorPos(1,1)
 print("== POCKET ICBM UPLINK ==")
 
 print("------------------------")
-print("Target X:")
-local tX = tonumber(io.read())
-print("Target Z:")
-local tZ = tonumber(io.read())
-print("Target Y (Elevation):")
-local tY = tonumber(io.read())
+print("Enter values one at a time when")
+print("prompted, OR type them all on one")
+print("line separated by spaces, in order:")
+print("X Z Y Charges Tier Mode(1/2)")
+print("------------------------")
 
-print("Number of Charges:")
-local charges = tonumber(io.read())
+-- Shared token buffer: if a line contains multiple values, they get
+-- queued up and handed out one at a time to the remaining prompts
+-- without asking again. If it only has one (or none), we just fall
+-- back to prompting for the next field normally.
+local tokenBuffer = {}
+local function nextToken(promptText)
+    while #tokenBuffer == 0 do
+        print(promptText)
+        local line = io.read() or ""
+        for tok in line:gmatch("%S+") do table.insert(tokenBuffer, tok) end
+    end
+    return table.remove(tokenBuffer, 1)
+end
 
-print("Charge Tier (0=Base, 1-5=Mk1-5):")
-local chargeTier = tonumber(io.read()) or 0
+local tX = tonumber(nextToken("Target X:"))
+local tZ = tonumber(nextToken("Target Z:"))
+local tY = tonumber(nextToken("Target Y (Elevation):"))
+local charges = tonumber(nextToken("Number of Charges:"))
+local chargeTier = tonumber(nextToken("Charge Tier (0=Base, 1-5=Mk1-5):")) or 0
+local modeToken = nextToken("Fire Mode (1=Normal, 2=High-Arc):")
+local isHighArc = (modeToken == "2")
 
-print("Fire Mode (1=Normal, 2=High-Arc):")
-local modeInput = io.read()
-local isHighArc = (modeInput == "2")
+if not (tX and tZ and tY and charges) then
+    print("\nERROR: Missing or invalid target data.")
+    print("Restart and enter numeric values.")
+    return
+end
 
 print("\nContacting Firemission Director...")
 rednet.broadcast({
