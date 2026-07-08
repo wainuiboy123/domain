@@ -1,22 +1,27 @@
 --[[
     HOTSPOT HEATMAP
     ---------------
-    Tracks tracked players' positions using a Player Detector peripheral
-    named "player_detector", polling every 3 seconds while they're online.
+    Tracks tracked players' positions using the Player Detector peripheral
+    (type "playerDetector"), polling as fast as practically possible while
+    they're online, and displays a live, connected trail/heatmap on a
+    monitor named "monitor" using sub-pixel rendering (~6x more pixels
+    than the monitor's character grid).
 
-    The currently "watched" player's movement is displayed as a live
-    heatmap on a monitor (default peripheral name "heatmap_monitor", or
-    it'll grab any connected monitor if that name isn't found), using the
-    maximum character resolution the monitor supports.
+    REQUIRES: pixelbox_lite.lua in the same folder as this script.
 
     Grid layout:
       - Bottom-left pixel  = the player's most -X/-Z position seen this login
       - Top-right pixel    = the player's most +X/+Z position seen this login
       - Color goes from blue (rarely visited) to red (frequently visited)
+      - The bounding box (and the whole map) rescales live as the player
+        wanders further out, so it always fits their full travelled area
       - Tracking resets fresh every time the player logs back in
 
-    Click (right-click / "use") any pixel on the monitor to print that
-    pixel's approximate real-world coordinates to this computer's terminal.
+    Click (right-click / "use") any spot on the monitor to print the
+    approximate real-world coordinates of the hottest pixel under that
+    click to this computer's terminal. (Minecraft only reports which
+    character cell was touched, not the exact sub-pixel - so we report
+    whichever of that cell's sub-pixels was visited most.)
 
     COMMANDS:
       add <username>        - start tracking a player
@@ -29,7 +34,19 @@
 ]]
 
 -- ===================== CONFIG =====================
-local POLL_INTERVAL = 3     -- seconds between position checks
+local POLL_INTERVAL = 0.05  -- seconds between position checks (~1 game tick,
+                             -- the fastest a CC:Tweaked timer can fire)
+local MAX_SAMPLES   = 4000  -- cap on stored points per player session, so
+                             -- fast polling + long sessions can't slowly
+                             -- balloon memory/render time into "too long
+                             -- without yielding" errors. Oldest points are
+                             -- dropped first; raise this if your server
+                             -- handles it fine.
+local LINE_STEP      = 1    -- blocks between interpolated points, so fast
+                             -- movement still draws as a continuous line
+local LINE_MAX_GAP   = 200  -- don't connect jumps bigger than this (login,
+                             -- teleport, dimension change, etc.)
+
 local PLAYERS_FILE  = "tracked_players.txt"
 
 local GRADIENT = {
@@ -38,25 +55,37 @@ local GRADIENT = {
 }
 local EMPTY_COLOR = colors.black
 
+-- ===================== LIBRARIES =====================
+local pixelbox = dofile("pixelbox_lite.lua")
+
 -- ===================== PERIPHERALS =====================
-local pd = peripheral.wrap("player_detector")
+-- Per Advanced Peripherals docs: use peripheral.find("playerDetector") to
+-- get a callable handle (the playerJoin/playerLeave EVENTS fire without
+-- needing find/wrap, but calling getPlayerPos requires this).
+local pd = peripheral.find("playerDetector")
 if not pd then
-    error("No peripheral named 'player_detector' found. Check it's connected and named correctly.")
+    error("No player_detector found. Check it's connected to this computer.")
 end
 
-local mon = peripheral.wrap("heatmap_monitor") or peripheral.find("monitor")
+local mon = peripheral.wrap("monitor")
 if not mon then
-    error("No monitor found. Connect one (ideally named 'heatmap_monitor').")
+    error("No peripheral named 'monitor' found. Check it's connected and named correctly.")
 end
 
-mon.setTextScale(0.5) -- smallest scale = max character resolution
-local GRID_W, GRID_H = mon.getSize()
+mon.setTextScale(0.5) -- smallest scale = max character resolution, which
+                       -- also maximizes the sub-pixel resolution below
+
+local box = pixelbox.new(mon)
+local GRID_W, GRID_H = box.width, box.height -- sub-pixel canvas size (~6x
+                                              -- the character grid)
 
 -- ===================== STATE =====================
 local players = {}         -- { [name] = true }
 local sessions = {}        -- sessions[name] = { active, minX,maxX,minZ,maxZ, samples = {} }
 local watchedPlayer = nil
-local lastBounds = nil     -- bounding box used for the last render, for touch lookups
+local lastBounds = nil     -- bounding box used for the last render
+local lastGrid = nil       -- grid[col][row] = count, from the last render
+local lastMaxCount = 0
 
 -- ===================== PERSISTENCE =====================
 local function loadPlayers()
@@ -101,9 +130,8 @@ local function ensureSession(name)
     return sessions[name]
 end
 
--- Record a sample point into the player's session, updating bounds.
-local function recordSample(name, x, z)
-    local s = ensureSession(name)
+-- Push one raw point into a session, updating bounds and the sample cap.
+local function addPoint(s, x, z)
     if not s.minX then
         s.minX, s.maxX, s.minZ, s.maxZ = x, x, z, z
     else
@@ -112,11 +140,34 @@ local function recordSample(name, x, z)
         if z < s.minZ then s.minZ = z end
         if z > s.maxZ then s.maxZ = z end
     end
-    s.lastX, s.lastZ = x, z
     table.insert(s.samples, { x = x, z = z })
+    if #s.samples > MAX_SAMPLES then
+        table.remove(s.samples, 1)
+    end
 end
 
--- Map a world coordinate to a grid cell using a session's CURRENT bounds.
+-- Record a new position, interpolating from the last one so the trail
+-- reads as a continuous connected line rather than scattered dots.
+local function recordSample(name, x, z)
+    local s = ensureSession(name)
+
+    if s.lastX and s.lastZ then
+        local dx, dz = x - s.lastX, z - s.lastZ
+        local dist = math.sqrt(dx * dx + dz * dz)
+        if dist > 0 and dist <= LINE_MAX_GAP then
+            local steps = math.floor(dist / LINE_STEP)
+            for i = 1, steps - 1 do
+                local t = i / steps
+                addPoint(s, s.lastX + dx * t, s.lastZ + dz * t)
+            end
+        end
+    end
+
+    addPoint(s, x, z)
+    s.lastX, s.lastZ = x, z
+end
+
+-- Map a world coordinate to a sub-pixel cell using a session's CURRENT bounds.
 local function worldToCell(s, x, z)
     local col, row
     if s.maxX == s.minX then
@@ -163,42 +214,38 @@ end
 
 -- ===================== RENDERING =====================
 local function drawHeatmap(name)
-    mon.setBackgroundColor(EMPTY_COLOR)
-    mon.clear()
-
     local s = sessions[name]
     if not s or not s.minX then
-        lastBounds = nil
+        box:clear(EMPTY_COLOR)
+        box:render()
+        lastBounds, lastGrid, lastMaxCount = nil, nil, 0
         return
     end
 
     local grid, maxCount = rebuildGrid(name)
 
     for col = 1, GRID_W do
+        local column = grid[col]
         for row = 1, GRID_H do
-            local count = (grid[col] and grid[col][row]) or 0
-            local color = colorFor(count, maxCount)
-            if color ~= EMPTY_COLOR then
-                mon.setCursorPos(col, row)
-                mon.setBackgroundColor(color)
-                mon.write(" ")
-            end
+            local count = column and column[row] or 0
+            box.canvas[row][col] = colorFor(count, maxCount)
         end
     end
+    box:render()
 
     lastBounds = {
         name = name,
         minX = s.minX, maxX = s.maxX, minZ = s.minZ, maxZ = s.maxZ,
         y = s.lastY,
     }
+    lastGrid = grid
+    lastMaxCount = maxCount
 end
 
--- Convert a clicked monitor cell back into approximate world coordinates.
-local function pixelToCoords(col, row)
-    if not lastBounds then return nil end
+-- Convert a sub-pixel cell back into approximate world coordinates.
+local function cellToWorld(col, row)
     local b = lastBounds
     local x, z
-
     if b.maxX == b.minX then
         x = b.minX
     else
@@ -209,8 +256,33 @@ local function pixelToCoords(col, row)
     else
         z = b.maxZ - (row - 1) / (GRID_H - 1) * (b.maxZ - b.minZ)
     end
-
     return math.floor(x + 0.5), math.floor(z + 0.5)
+end
+
+-- A monitor_touch event only gives us a character cell, which covers a
+-- 2 (wide) x 3 (tall) block of sub-pixels. Report whichever of those
+-- six was visited most, falling back to the cell's center if empty.
+local function touchToCoords(charX, charY)
+    if not lastBounds then return nil end
+
+    local colStart = (charX - 1) * 2 + 1
+    local rowStart = (charY - 1) * 3 + 1
+
+    local bestCol, bestRow, bestCount = colStart, rowStart, -1
+    for dc = 0, 1 do
+        for dr = 0, 2 do
+            local col, row = colStart + dc, rowStart + dr
+            if col >= 1 and col <= GRID_W and row >= 1 and row <= GRID_H then
+                local count = (lastGrid and lastGrid[col] and lastGrid[col][row]) or 0
+                if count > bestCount then
+                    bestCount = count
+                    bestCol, bestRow = col, row
+                end
+            end
+        end
+    end
+
+    return cellToWorld(bestCol, bestRow)
 end
 
 -- ===================== POLLING =====================
@@ -220,12 +292,7 @@ local function pollOnce()
         local x, y, z = tryGetPos(name)
 
         if x then
-            if not s.active then
-                -- Catches the case where the computer started up while the
-                -- player was already online (no playerJoin event fires for
-                -- that, since they didn't just join).
-                s.active = true
-            end
+            s.active = true
             s.lastY = y
             recordSample(name, x, z)
         else
@@ -239,9 +306,9 @@ local function pollOnce()
 end
 
 -- ===================== JOIN/LEAVE EVENTS =====================
--- player_detector fires these directly once connected, no wrap needed.
--- This gives us an exact, instant moment to reset a session, rather
--- than inferring it from the next 3-second poll.
+-- player_detector fires these directly once connected, no wrap/find
+-- needed for the events themselves. This gives us an exact, instant
+-- moment to reset a session, rather than inferring it from a poll.
 local function joinLeaveLoop()
     while true do
         local event, username = os.pullEvent()
@@ -290,8 +357,8 @@ local function handleCommand(line)
         sessions[args[2]] = nil
         if watchedPlayer == args[2] then
             watchedPlayer = nil
-            mon.setBackgroundColor(EMPTY_COLOR)
-            mon.clear()
+            box:clear(EMPTY_COLOR)
+            box:render()
         end
         savePlayers()
         print("Stopped tracking " .. args[2])
@@ -327,7 +394,7 @@ local function handleCommand(line)
         return false
 
     elseif cmd == "help" then
-        print("Commands: add <name> | remove <name> | list | watch <name> | status | reset <name> | exit")
+        print("Commands: add <n> | remove <n> | list | watch <n> | status | reset <n> | exit")
 
     else
         print("Unknown command. Type 'help' for a list of commands.")
@@ -367,11 +434,11 @@ end
 local function touchLoop()
     while true do
         local event, side, tx, ty = os.pullEvent("monitor_touch")
-        if watchedPlayer then
-            local x, z = pixelToCoords(tx, ty)
+        if watchedPlayer and lastBounds then
+            local x, z = touchToCoords(tx, ty)
             if x then
                 print(string.format(
-                    "Clicked pixel (%d,%d) -> approx coords: X=%d Z=%d (%s)",
+                    "Clicked (%d,%d) -> approx coords: X=%d Z=%d (%s)",
                     tx, ty, x, z, watchedPlayer
                 ))
             end
@@ -382,5 +449,8 @@ end
 -- ===================== MAIN =====================
 players = loadPlayers()
 for name in pairs(players) do ensureSession(name) end
+
+box:clear(EMPTY_COLOR)
+box:render()
 
 parallel.waitForAny(commandLoop, pollLoop, touchLoop, joinLeaveLoop)
