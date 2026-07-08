@@ -13,10 +13,13 @@
       - Every time a tracked player logs in, a brand new "session" starts
         (a fresh heatmap with its own bounding box). Previous sessions are
         never modified again - they're frozen in place as history.
-      - The active session autosaves to disk every SESSION_SAVE_INTERVAL
-        seconds, and gets a final save the moment the player logs out.
-      - All sessions for a player are saved under heatmap_data/<name>/,
-        one file per session plus an index file for quick listing.
+      - The active session autosaves every SESSION_SAVE_INTERVAL seconds,
+        and gets a final save the moment the player logs out.
+      - Everything (tracked players + every session's full history) is
+        stored as a single blob in the "nbt_storage" peripheral. There's
+        no separate file per session anymore - one block holds it all.
+      - Anyone who joins and isn't already tracked gets added and started
+        automatically - you don't need to "add" people by hand.
 
     ON-MONITOR NAVIGATION (type "watch" with no arguments):
       1. Tap a tracked player's name to see their session list.
@@ -27,9 +30,10 @@
          approximate coordinates of the hottest pixel under your tap.
 
     COMMANDS:
-      add <username>   - start tracking a player
+      add <username>   - start tracking a player right now (usually
+                          unnecessary - anyone who joins is auto-tracked)
       add *            - start tracking every currently online player
-      remove <username>- stop tracking a player (keeps saved history on disk)
+      remove <username>- stop tracking a player (keeps saved history)
       remove *         - stop tracking everyone
       list             - show tracked players
       watch [username] - open the on-monitor picker (or jump to a player's
@@ -501,9 +505,6 @@ local MAX_SAMPLES            = 20000 -- cap on stored raw points per player sess
 local LINE_MAX_GAP           = 200   -- don't draw a connecting line across jumps bigger than
                                       -- this (login, teleport, dimension change, etc.)
 
-local DATA_DIR      = "heatmap_data"
-local PLAYERS_FILE  = "tracked_players.txt"
-
 local GRADIENT = {
     colors.blue, colors.cyan, colors.lightBlue, colors.green,
     colors.lime, colors.yellow, colors.orange, colors.red
@@ -521,7 +522,7 @@ local GRADIENT_GAMMA = 0.45
 -- ===================== PERIPHERALS =====================
 -- Found by TYPE, not name - matches any peripheral reporting that type,
 -- regardless of what it's actually named.
-local pd = peripheral.find("playerDetector")
+local pd = peripheral.find("player_detector")
 if not pd then
     error("No player_detector found. Check it's connected to this computer.")
 end
@@ -529,6 +530,14 @@ end
 local mon = peripheral.find("monitor")
 if not mon then
     error("No monitor found. Check it's connected to this computer (directly or via wired modem).")
+end
+
+-- Named "nbt_storage" specifically, per setup. All persistence (tracked
+-- players + every session's full history) lives in this ONE block as a
+-- single NBT blob - there's no per-file storage anymore.
+local nbtStorage = peripheral.find("nbt_storage") or peripheral.find("nbtStorage")
+if not nbtStorage then
+    error("No NBT Storage peripheral named 'nbt_storage' found. Check it's connected to this computer.")
 end
 
 mon.setTextScale(0.5) -- smallest scale = max character resolution
@@ -542,26 +551,45 @@ local box = pixelbox.new(heatmapWindow)
 local GRID_W, GRID_H = box.width, box.height
 
 -- ===================== STATE =====================
-local players = {}   -- { [name] = true }
+-- Everything persists as ONE blob in the nbt_storage block:
+--   root.players           = { [name] = true, ... }
+--   root.data[name].index  = { {id=,startTime=,lastUpdate=,live=}, ... }
+--   root.data[name].sessions[tostring(id)] = full session snapshot
+local root = { players = {}, data = {} }
+local players = root.players -- same table reference; mutating one mutates both
 local sessions = {}  -- sessions[name] = the CURRENT (active or last-known) in-memory session
 local uiState = { mode = "none", clickable = {} }
     -- mode: "none" | "picker" | "sessions" | "heatmap"
 
--- ===================== PLAYER LIST PERSISTENCE =====================
-local function loadPlayers()
-    if not fs.exists(PLAYERS_FILE) then return {} end
-    local f = fs.open(PLAYERS_FILE, "r")
-    local contents = f.readAll()
-    f.close()
-    local ok, result = pcall(textutils.unserialize, contents)
-    if ok and result then return result end
-    return {}
+-- ===================== NBT STORAGE PERSISTENCE =====================
+-- NOTE: writeTable() replaces the ENTIRE contents of the block every call,
+-- there's no partial/keyed update - so every save writes the full history
+-- of every tracked player, not just what changed. Fine for normal use, but
+-- worth knowing if you end up with many players and long session histories:
+-- saves will get bigger and slower over time. Pruning old sessions (not
+-- implemented here) would be the fix if that ever becomes a problem.
+local function loadAll()
+    local ok, data = pcall(function() return nbtStorage.read() end)
+    if ok and type(data) == "table" then
+        root = data
+        root.players = root.players or {}
+        root.data = root.data or {}
+    else
+        root = { players = {}, data = {} }
+    end
+    players = root.players
 end
 
-local function savePlayers()
-    local f = fs.open(PLAYERS_FILE, "w")
-    f.write(textutils.serialize(players))
-    f.close()
+local function saveAll()
+    local ok, err = pcall(function() return nbtStorage.writeTable(root) end)
+    if not ok then
+        print("WARNING: failed to save to nbt_storage: " .. tostring(err))
+    end
+end
+
+local function ensurePlayerData(name)
+    root.data[name] = root.data[name] or { index = {}, sessions = {} }
+    return root.data[name]
 end
 
 -- ===================== TIME / NZ TIMEZONE HELPERS =====================
@@ -636,70 +664,66 @@ local function timeAgo(epochMillis)
     return math.floor(hours / 24) .. "d ago"
 end
 
--- ===================== SESSION FILE PERSISTENCE =====================
-local function ensureDir(path)
-    if not fs.exists(path) then fs.makeDir(path) end
-end
-
-local function playerDir(name)
-    ensureDir(DATA_DIR)
-    local dir = DATA_DIR .. "/" .. name
-    ensureDir(dir)
-    return dir
-end
-
-local function indexPath(name) return playerDir(name) .. "/index.txt" end
-local function sessionPath(name, id) return playerDir(name) .. "/" .. id .. ".txt" end
-
+-- ===================== SESSION PERSISTENCE (within the NBT blob) =====================
+-- The in-memory grid is sparse and keyed by numeric col/row, which NBT's
+-- list-vs-compound conversion can mangle. To keep it safe, it's flattened
+-- to a single string-keyed map ("col_row" -> count) before it ever touches
+-- writeTable(), and rebuilt back into nested col->row form on load.
 local function loadIndex(name)
-    local path = indexPath(name)
-    if not fs.exists(path) then return {} end
-    local f = fs.open(path, "r")
-    local contents = f.readAll()
-    f.close()
-    local ok, result = pcall(textutils.unserialize, contents)
-    if ok and result then return result end
-    return {}
-end
-
-local function saveIndex(name, idx)
-    local f = fs.open(indexPath(name), "w")
-    f.write(textutils.serialize(idx))
-    f.close()
+    return ensurePlayerData(name).index
 end
 
 local function upsertIndexEntry(name, entry)
-    local idx = loadIndex(name)
+    local pdata = ensurePlayerData(name)
     local found = false
-    for i, e in ipairs(idx) do
-        if e.id == entry.id then idx[i] = entry; found = true; break end
+    for i, e in ipairs(pdata.index) do
+        if e.id == entry.id then pdata.index[i] = entry; found = true; break end
     end
-    if not found then table.insert(idx, entry) end
-    saveIndex(name, idx)
+    if not found then table.insert(pdata.index, entry) end
 end
 
+-- Updates the in-memory root table only. Does NOT write to the peripheral -
+-- call saveAll() afterward (once, even if several sessions changed).
 local function persistSession(name, s)
-    local data = {
+    local flatGrid = {}
+    for col, column in pairs(s.grid) do
+        for row, count in pairs(column) do
+            flatGrid[col .. "_" .. row] = count
+        end
+    end
+
+    local pdata = ensurePlayerData(name)
+    pdata.sessions[tostring(s.id)] = {
         id = s.id, startTime = s.startTime, lastUpdate = s.lastUpdate, live = s.active,
         minX = s.minX, maxX = s.maxX, minZ = s.minZ, maxZ = s.maxZ,
-        grid = s.grid, maxCount = s.maxCount,
+        maxCount = s.maxCount, grid = flatGrid,
     }
-    local f = fs.open(sessionPath(name, s.id), "w")
-    f.write(textutils.serialize(data))
-    f.close()
     upsertIndexEntry(name, { id = s.id, startTime = s.startTime, lastUpdate = s.lastUpdate, live = s.active })
 end
 
 local function loadSessionData(name, id)
-    local path = sessionPath(name, id)
-    if not fs.exists(path) then return nil end
-    local f = fs.open(path, "r")
-    local contents = f.readAll()
-    f.close()
-    local ok, result = pcall(textutils.unserialize, contents)
-    if ok then return result end
-    return nil
+    local pdata = ensurePlayerData(name)
+    local raw = pdata.sessions[tostring(id)]
+    if not raw then return nil end
+
+    local grid = {}
+    for key, count in pairs(raw.grid or {}) do
+        local colStr, rowStr = key:match("^(%-?%d+)_(%-?%d+)$")
+        if colStr then
+            local col, row = tonumber(colStr), tonumber(rowStr)
+            grid[col] = grid[col] or {}
+            grid[col][row] = count
+        end
+    end
+
+    return {
+        id = raw.id, startTime = raw.startTime, lastUpdate = raw.lastUpdate, live = raw.live,
+        minX = raw.minX, maxX = raw.maxX, minZ = raw.minZ, maxZ = raw.maxZ,
+        maxCount = raw.maxCount, grid = grid,
+    }
 end
+
+
 
 -- ===================== PLAYER DETECTOR HELPERS =====================
 local function tryGetPos(name)
@@ -971,6 +995,7 @@ local function createSession(name)
     s.active = true
     sessions[name] = s
     persistSession(name, s) -- so it shows up in the session list immediately
+    saveAll()
     return s
 end
 
@@ -981,6 +1006,7 @@ local function finalizeSession(name)
         s.active = false
         s.lastUpdate = epochMs()
         persistSession(name, s)
+        saveAll()
     end
 end
 
@@ -1119,36 +1145,29 @@ end
 local function joinLeaveLoop()
     while true do
         local event, username = os.pullEvent()
-
         if event == "playerJoin" then
-            -- Automatically begin tracking anyone who joins.
             if not players[username] then
                 players[username] = true
-                savePlayers()
-                print("Automatically started tracking " .. username)
+                print(username .. " joined and wasn't tracked yet - now tracking them too.")
+                if uiState.mode == "picker" then renderPlayerPicker() end
             end
-
             createSession(username)
             print(username .. " logged in - starting new heatmap session.")
-
             if uiState.mode == "sessions" and uiState.player == username then
                 renderSessionPicker(username)
             elseif uiState.mode == "picker" then
                 renderPlayerPicker()
             end
-
         elseif event == "playerLeave" and players[username] then
             finalizeSession(username)
             print(username .. " logged out - session saved.")
-
             if uiState.mode == "heatmap" and uiState.player == username and uiState.isLive then
-                uiState.isLive = false
+                uiState.isLive = false -- freeze current view; data is already final
             elseif uiState.mode == "sessions" and uiState.player == username then
                 renderSessionPicker(username)
             elseif uiState.mode == "picker" then
                 renderPlayerPicker()
             end
-
         elseif event == "hotspot_exit" then
             return
         end
@@ -1164,13 +1183,17 @@ local function autosaveLoop()
             if event == "timer" and id == timerId then break
             elseif event == "hotspot_exit" then return end
         end
+        local anyActive = false
         for name, s in pairs(sessions) do
             if s.active then
                 if s.needsRescale then rescaleSession(s) end
                 s.lastUpdate = epochMs()
                 persistSession(name, s)
+                anyActive = true
             end
         end
+        if anyActive then saveAll() end -- one write covering everyone this tick,
+                                         -- not one write per active player
     end
 end
 
@@ -1218,11 +1241,11 @@ local function handleCommand(line)
                 if not players[uname] then added = added + 1 end
                 addPlayer(uname)
             end
-            savePlayers()
+            saveAll()
             print("Tracking " .. added .. " newly added player(s); " .. #online .. " online total.")
         else
             addPlayer(args[2])
-            savePlayers()
+            saveAll()
             print("Now tracking " .. args[2])
         end
 
@@ -1231,11 +1254,11 @@ local function handleCommand(line)
             local names = {}
             for n in pairs(players) do table.insert(names, n) end
             for _, n in ipairs(names) do removePlayer(n) end
-            savePlayers()
+            saveAll()
             print("Stopped tracking all players (" .. #names .. ").")
         else
             removePlayer(args[2])
-            savePlayers()
+            saveAll()
             print("Stopped tracking " .. args[2])
         end
 
@@ -1279,6 +1302,7 @@ local function handleCommand(line)
             s.lastUpdate = epochMs()
             sessions[args[2]] = s
             persistSession(args[2], s)
+            saveAll()
             if uiState.mode == "heatmap" and uiState.player == args[2] and uiState.isLive then
                 fullRecolor(s)
             end
@@ -1288,7 +1312,7 @@ local function handleCommand(line)
         end
 
     elseif cmd == "exit" or cmd == "quit" then
-        savePlayers()
+        saveAll()
         print("Saving and exiting...")
         return false
 
@@ -1394,7 +1418,7 @@ local function touchLoop()
 end
 
 -- ===================== MAIN =====================
-players = loadPlayers()
+loadAll()
 for name in pairs(players) do
     ensureSession(name)
     local x = tryGetPos(name)
