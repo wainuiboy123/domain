@@ -54,7 +54,7 @@ local GRID_W, GRID_H = mon.getSize()
 
 -- ===================== STATE =====================
 local players = {}         -- { [name] = true }
-local sessions = {}        -- sessions[name] = { active, minX,maxX,minZ,maxZ, grid = {}, maxCount }
+local sessions = {}        -- sessions[name] = { active, minX,maxX,minZ,maxZ, samples = {} }
 local watchedPlayer = nil
 local lastBounds = nil     -- bounding box used for the last render, for touch lookups
 
@@ -89,8 +89,10 @@ local function newSession()
     return {
         active = false,
         minX = nil, maxX = nil, minZ = nil, maxZ = nil,
-        grid = {},   -- grid[col][row] = count
-        maxCount = 0,
+        samples = {},   -- raw {x=, z=} points; grid is rebuilt from these
+                        -- on every draw, so a growing bounding box rescales
+                        -- ALL prior points instead of leaving them stuck
+                        -- at their old position.
     }
 end
 
@@ -111,18 +113,11 @@ local function recordSample(name, x, z)
         if z > s.maxZ then s.maxZ = z end
     end
     s.lastX, s.lastZ = x, z
+    table.insert(s.samples, { x = x, z = z })
 end
 
--- Recompute the col/row grid for a session from its raw bounds.
--- (We store cumulative hit counts directly per grid cell, rebucketing
--- happens naturally since cell width grows as bounds expand - to keep
--- this simple and fast we just re-bin using current bounds each time
--- a NEW sample comes in, weighting only the new sample into whichever
--- cell it currently falls into.)
-local function binSample(name, x, z)
-    local s = sessions[name]
-    if not s or not s.minX then return end
-
+-- Map a world coordinate to a grid cell using a session's CURRENT bounds.
+local function worldToCell(s, x, z)
     local col, row
     if s.maxX == s.minX then
         col = math.ceil(GRID_W / 2)
@@ -135,15 +130,27 @@ local function binSample(name, x, z)
         -- flip Z so max Z (top-right requirement) ends up at the top row
         row = 1 + math.floor((s.maxZ - z) / (s.maxZ - s.minZ) * (GRID_H - 1) + 0.5)
     end
-
     col = math.max(1, math.min(GRID_W, col))
     row = math.max(1, math.min(GRID_H, row))
+    return col, row
+end
 
-    s.grid[col] = s.grid[col] or {}
-    s.grid[col][row] = (s.grid[col][row] or 0) + 1
-    if s.grid[col][row] > s.maxCount then
-        s.maxCount = s.grid[col][row]
+-- Rebuild the full grid + max count from raw samples, using the
+-- session's current bounds. This is what makes the heatmap rescale
+-- itself whenever a player travels outside the previously-seen area.
+local function rebuildGrid(name)
+    local s = sessions[name]
+    if not s or not s.minX then return nil, 0 end
+
+    local grid = {}
+    local maxCount = 0
+    for _, p in ipairs(s.samples) do
+        local col, row = worldToCell(s, p.x, p.z)
+        grid[col] = grid[col] or {}
+        grid[col][row] = (grid[col][row] or 0) + 1
+        if grid[col][row] > maxCount then maxCount = grid[col][row] end
     end
+    return grid, maxCount
 end
 
 local function colorFor(count, maxCount)
@@ -165,10 +172,12 @@ local function drawHeatmap(name)
         return
     end
 
+    local grid, maxCount = rebuildGrid(name)
+
     for col = 1, GRID_W do
         for row = 1, GRID_H do
-            local count = (s.grid[col] and s.grid[col][row]) or 0
-            local color = colorFor(count, s.maxCount)
+            local count = (grid[col] and grid[col][row]) or 0
+            local color = colorFor(count, maxCount)
             if color ~= EMPTY_COLOR then
                 mon.setCursorPos(col, row)
                 mon.setBackgroundColor(color)
@@ -212,25 +221,44 @@ local function pollOnce()
 
         if x then
             if not s.active then
-                -- Fresh login detected -> reset session entirely
-                sessions[name] = newSession()
-                s = sessions[name]
+                -- Catches the case where the computer started up while the
+                -- player was already online (no playerJoin event fires for
+                -- that, since they didn't just join).
                 s.active = true
-                print(name .. " came online - starting new heatmap session.")
             end
             s.lastY = y
             recordSample(name, x, z)
-            binSample(name, x, z)
         else
-            if s.active then
-                print(name .. " went offline - freezing heatmap.")
-            end
             s.active = false
         end
     end
 
     if watchedPlayer then
         drawHeatmap(watchedPlayer)
+    end
+end
+
+-- ===================== JOIN/LEAVE EVENTS =====================
+-- player_detector fires these directly once connected, no wrap needed.
+-- This gives us an exact, instant moment to reset a session, rather
+-- than inferring it from the next 3-second poll.
+local function joinLeaveLoop()
+    while true do
+        local event, username = os.pullEvent()
+        if event == "playerJoin" and players[username] then
+            sessions[username] = newSession()
+            sessions[username].active = true
+            print(username .. " logged in - starting new heatmap session.")
+            if watchedPlayer == username then
+                drawHeatmap(username)
+            end
+        elseif event == "playerLeave" and players[username] then
+            local s = sessions[username]
+            if s then s.active = false end
+            print(username .. " logged out - freezing heatmap.")
+        elseif event == "hotspot_exit" then
+            return
+        end
     end
 end
 
@@ -355,4 +383,4 @@ end
 players = loadPlayers()
 for name in pairs(players) do ensureSession(name) end
 
-parallel.waitForAny(commandLoop, pollLoop, touchLoop)
+parallel.waitForAny(commandLoop, pollLoop, touchLoop, joinLeaveLoop)
