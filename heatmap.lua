@@ -521,7 +521,7 @@ local GRADIENT_GAMMA = 0.45
 -- ===================== PERIPHERALS =====================
 -- Found by TYPE, not name - matches any peripheral reporting that type,
 -- regardless of what it's actually named.
-local pd = peripheral.find("player_detector")
+local pd = peripheral.find("playerDetector")
 if not pd then
     error("No player_detector found. Check it's connected to this computer.")
 end
@@ -1119,24 +1119,36 @@ end
 local function joinLeaveLoop()
     while true do
         local event, username = os.pullEvent()
-        if event == "playerJoin" and players[username] then
+
+        if event == "playerJoin" then
+            -- Automatically begin tracking anyone who joins.
+            if not players[username] then
+                players[username] = true
+                savePlayers()
+                print("Automatically started tracking " .. username)
+            end
+
             createSession(username)
             print(username .. " logged in - starting new heatmap session.")
+
             if uiState.mode == "sessions" and uiState.player == username then
                 renderSessionPicker(username)
             elseif uiState.mode == "picker" then
                 renderPlayerPicker()
             end
+
         elseif event == "playerLeave" and players[username] then
             finalizeSession(username)
             print(username .. " logged out - session saved.")
+
             if uiState.mode == "heatmap" and uiState.player == username and uiState.isLive then
-                uiState.isLive = false -- freeze current view; data is already final
+                uiState.isLive = false
             elseif uiState.mode == "sessions" and uiState.player == username then
                 renderSessionPicker(username)
             elseif uiState.mode == "picker" then
                 renderPlayerPicker()
             end
+
         elseif event == "hotspot_exit" then
             return
         end
