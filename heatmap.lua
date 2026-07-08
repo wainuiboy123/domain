@@ -1,79 +1,43 @@
 --[[
-    HOTSPOT HEATMAP (combined, optimized single-file version)
+    HOTSPOT HEATMAP
     -----------------------------------------------------------
     Tracks tracked players' positions using the Player Detector peripheral
     (type "playerDetector"), polling as fast as practically possible while
     they're online, and displays a live, connected trail/heatmap on a
-    monitor (found by type, not name) using sub-pixel rendering (~6x more
-    pixels than the monitor's character grid).
+    monitor (found by type, not name) using sub-pixel rendering.
 
-    SELF-CONTAINED: pixelbox_lite (by 9551-Dev, MIT License, see the
-    embedded copy below) is now embedded directly in this file. You no
-    longer need a separate pixelbox_lite.lua alongside this script.
+    SELF-CONTAINED: pixelbox_lite (by 9551-Dev, MIT License) is embedded
+    directly below. You only need this one file.
 
-    Grid layout:
-      - Bottom-left pixel  = the player's most -X/-Z position seen this login
-      - Top-right pixel    = the player's most +X/+Z position seen this login
-      - Color goes from blue (rarely visited) to red (frequently visited)
-      - The bounding box (and the whole map) rescales live as the player
-        wanders further out, so it always fits their full travelled area
-      - Tracking resets fresh every time the player logs back in
-      - Every step is connected to the previous one with an exact line
-        (Bresenham, drawn directly in the sub-pixel grid), so fast
-        movement between polls still reads as a continuous trail, not
-        scattered dots
+    SESSIONS & HISTORY:
+      - Every time a tracked player logs in, a brand new "session" starts
+        (a fresh heatmap with its own bounding box). Previous sessions are
+        never modified again - they're frozen in place as history.
+      - The active session autosaves to disk every SESSION_SAVE_INTERVAL
+        seconds, and gets a final save the moment the player logs out.
+      - All sessions for a player are saved under heatmap_data/<name>/,
+        one file per session plus an index file for quick listing.
 
-    Click (right-click / "use") any spot on the monitor to print the
-    approximate real-world coordinates of the hottest pixel under that
-    click to this computer's terminal. (Minecraft only reports which
-    character cell was touched, not the exact sub-pixel - so we report
-    whichever of that cell's sub-pixels was visited most.)
+    ON-MONITOR NAVIGATION (type "watch" with no arguments):
+      1. Tap a tracked player's name to see their session list.
+      2. Each session shows either "LIVE" (red, still updating) or how
+         long ago it was last updated plus an NZT timestamp.
+      3. Tap a session to view its heatmap. Tap "< Back" (top row) to
+         go up a level. Tapping anywhere else on a heatmap prints the
+         approximate coordinates of the hottest pixel under your tap.
 
     COMMANDS:
-      add <username>        - start tracking a player
-      remove <username>     - stop tracking a player
-      list                  - show tracked players
-      watch <username>      - show this player's heatmap on the monitor
-      status                - show who's online right now
-      reset <username>      - wipe this player's current session data
-      exit                  - quit
-
-    ------------------------------------------------------------------
-    PERFORMANCE NOTES (why this version is much cheaper than the old one)
-    ------------------------------------------------------------------
-    OLD DESIGN: every single poll tick (~20/sec) rebuilt the ENTIRE grid
-    from every stored sample (up to MAX_SAMPLES of them), then repainted
-    the ENTIRE monitor canvas (every sub-pixel), then blitted. Cost grew
-    with total history and ran at full poll rate regardless of whether
-    anything visually significant had happened.
-
-    NEW DESIGN:
-      1. Each new position is drawn straight onto the grid with a
-         Bresenham line from the previous point - O(line length), not
-         O(all history). This happens every poll, and is what actually
-         produces the connected trail.
-      2. The grid is only fully rebuilt from raw samples when the
-         player's bounding box genuinely expands (new territory seen).
-         This is comparatively rare, and even then it's deferred to the
-         next render pass rather than done inline on every poll, so a
-         burst of expansion in one tick doesn't cause repeated rebuilds.
-      3. Polling (position updates -> grid updates) is decoupled from
-         rendering (grid -> monitor canvas -> blit). Rendering happens
-         on its own, slower timer, since blitting to a monitor is far
-         more expensive than updating a Lua table.
-      4. Most render passes only repaint the handful of "dirty" cells
-         that changed since the last frame, not the whole screen. A
-         full recolor of every cell (needed occasionally because a
-         cell's color depends on the *current* max count, which drifts
-         as hotter spots emerge) runs on its own slower interval.
-
-    Trade-off worth knowing: MAX_SAMPLES still caps how many raw points
-    are kept for bounding-box rebuilds. Dropping an old sample no longer
-    immediately erases its contribution from the grid (that would require
-    tracking exact line paths for eviction, which isn't worth the cost
-    for a heatmap) - it just won't be replayed the next time a rebuild
-    happens. In practice this is invisible; it only matters for extremely
-    long sessions.
+      add <username>   - start tracking a player
+      add *            - start tracking every currently online player
+      remove <username>- stop tracking a player (keeps saved history on disk)
+      remove *         - stop tracking everyone
+      list             - show tracked players
+      watch [username] - open the on-monitor picker (or jump to a player's
+                          session list directly)
+      back             - go up one level in the on-monitor UI
+      status           - show who's online right now
+      reset <username> - wipe the CURRENT session's data (history untouched)
+      exit             - quit
 ]]
 
 -- ===================== EMBEDDED LIBRARY: pixelbox_lite =====================
@@ -527,30 +491,17 @@ end)()
 -- ===================== END EMBEDDED LIBRARY =====================
 
 -- ===================== CONFIG =====================
-local POLL_INTERVAL = 0.05   -- seconds between position checks (~1 game tick,
-                              -- the fastest a CC:Tweaked timer can fire).
-                              -- Cheap now: a poll only does a Bresenham line
-                              -- into a Lua table, no monitor writes.
-local RENDER_INTERVAL = 0.15 -- seconds between monitor blits (~7/sec). Far
-                              -- more than a heatmap needs to look "live",
-                              -- and blitting is the expensive part, so this
-                              -- runs much slower than polling on purpose.
-local FULL_RECOLOR_INTERVAL = 1.0
-                              -- seconds between full-canvas repaints. Cell
-                              -- color depends on the CURRENT max visit
-                              -- count, which drifts as new hotspots emerge,
-                              -- so we periodically recolor everything to
-                              -- stay accurate. Between these, only cells
-                              -- that actually changed get repainted.
-local MAX_SAMPLES   = 20000  -- cap on stored raw points per player session
-                              -- (used only for rare bounding-box rebuilds
-                              -- now, not per-render, so this can be larger
-                              -- than before without a performance cost).
-local LINE_MAX_GAP   = 200   -- don't connect jumps bigger than this (login,
-                              -- teleport, dimension change, etc.) - the
-                              -- point is still recorded, just not linked
-                              -- to the previous one with a line.
+local POLL_INTERVAL          = 0.05  -- seconds between position checks (~1 tick)
+local RENDER_INTERVAL        = 0.15  -- seconds between monitor blits while watching a live session
+local FULL_RECOLOR_INTERVAL  = 1.0   -- seconds between full-canvas repaints (cell colors
+                                      -- depend on the current max count, which drifts)
+local SESSION_SAVE_INTERVAL  = 10    -- seconds between autosaves of the active session to disk
+local MAX_SAMPLES            = 20000 -- cap on stored raw points per player session (used only
+                                      -- for rare bounding-box rebuilds, not per-render)
+local LINE_MAX_GAP           = 200   -- don't draw a connecting line across jumps bigger than
+                                      -- this (login, teleport, dimension change, etc.)
 
+local DATA_DIR      = "heatmap_data"
 local PLAYERS_FILE  = "tracked_players.txt"
 
 local GRADIENT = {
@@ -558,13 +509,19 @@ local GRADIENT = {
     colors.lime, colors.yellow, colors.orange, colors.red
 }
 local EMPTY_COLOR = colors.black
+local GRADIENT_GAMMA = 0.45
+    -- Fix for hotspots not visibly going red: with a straight linear
+    -- scale, one single sub-pixel a player stood AFK on for ages became
+    -- the only "max", crushing every genuinely well-trodden area down
+    -- near the blue end. Raising intensity to a fractional power (<1)
+    -- pulls mid-range visit counts up the gradient much sooner, so a
+    -- real hangout spot actually reads as orange/red instead of needing
+    -- to match the single hottest pixel almost exactly.
 
 -- ===================== PERIPHERALS =====================
--- Found by TYPE, not name - this is what actually works reliably, since
--- peripheral.wrap() needs the exact network name (which is only "monitor"
--- if you happened to name it that), while peripheral.find() matches any
--- peripheral reporting that type, regardless of its name.
-local pd = peripheral.find("playerDetector")
+-- Found by TYPE, not name - matches any peripheral reporting that type,
+-- regardless of what it's actually named.
+local pd = peripheral.find("player_detector")
 if not pd then
     error("No player_detector found. Check it's connected to this computer.")
 end
@@ -574,19 +531,23 @@ if not mon then
     error("No monitor found. Check it's connected to this computer (directly or via wired modem).")
 end
 
-mon.setTextScale(0.5) -- smallest scale = max character resolution, which
-                       -- also maximizes the sub-pixel resolution below
+mon.setTextScale(0.5) -- smallest scale = max character resolution
 
-local box = pixelbox.new(mon)
-local GRID_W, GRID_H = box.width, box.height -- sub-pixel canvas size (~6x
-                                              -- the character grid)
+-- Row 1 of the monitor is permanently reserved for a header / back button,
+-- in every mode (menus AND heatmaps), so navigation is always available.
+-- The heatmap itself renders into a window covering the rest.
+local MON_W, MON_H = mon.getSize()
+local heatmapWindow = window.create(mon, 1, 2, MON_W, MON_H - 1)
+local box = pixelbox.new(heatmapWindow)
+local GRID_W, GRID_H = box.width, box.height
 
 -- ===================== STATE =====================
-local players = {}         -- { [name] = true }
-local sessions = {}        -- sessions[name] = session table, see newSession()
-local watchedPlayer = nil
+local players = {}   -- { [name] = true }
+local sessions = {}  -- sessions[name] = the CURRENT (active or last-known) in-memory session
+local uiState = { mode = "none", clickable = {} }
+    -- mode: "none" | "picker" | "sessions" | "heatmap"
 
--- ===================== PERSISTENCE =====================
+-- ===================== PLAYER LIST PERSISTENCE =====================
 local function loadPlayers()
     if not fs.exists(PLAYERS_FILE) then return {} end
     local f = fs.open(PLAYERS_FILE, "r")
@@ -603,7 +564,144 @@ local function savePlayers()
     f.close()
 end
 
--- ===================== HELPERS =====================
+-- ===================== TIME / NZ TIMEZONE HELPERS =====================
+local function epochMs()
+    return os.epoch("utc")
+end
+
+-- Zeller's congruence -> 0=Sunday .. 6=Saturday
+local function dayOfWeek(y, m, d)
+    if m < 3 then m = m + 12; y = y - 1 end
+    local K = y % 100
+    local J = math.floor(y / 100)
+    local h = (d + math.floor((13 * (m + 1)) / 5) + K + math.floor(K / 4) + math.floor(J / 4) + 5 * J) % 7
+    return (h + 6) % 7
+end
+
+local function lastSundayOfMonth(y, m, lastDay)
+    return lastDay - dayOfWeek(y, m, lastDay)
+end
+
+local function firstSundayOfMonth(y, m)
+    local dow = dayOfWeek(y, m, 1)
+    return 1 + ((7 - dow) % 7)
+end
+
+-- NZ daylight saving: starts last Sunday of Sept (2am), ends first Sunday
+-- of April (3am). This is the current (post-2007) rule.
+local function isNZDST(y, m, d, hour)
+    if m == 9 then
+        local lastSun = lastSundayOfMonth(y, 9, 30)
+        return d > lastSun or (d == lastSun and hour >= 2)
+    elseif m == 4 then
+        local firstSun = firstSundayOfMonth(y, 4)
+        return d < firstSun or (d == firstSun and hour < 3)
+    elseif m == 10 or m == 11 or m == 12 or m == 1 or m == 2 or m == 3 then
+        return true
+    else
+        return false -- May - Aug
+    end
+end
+
+local MONTH_NAMES = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"}
+
+local function nzBreakdown(epochMillis)
+    local utcSeconds = math.floor(epochMillis / 1000)
+    local utc = os.date("!*t", utcSeconds)
+    local dst = isNZDST(utc.year, utc.month, utc.day, utc.hour)
+    local nz = os.date("!*t", utcSeconds + (dst and 13 or 12) * 3600)
+    nz.isDST = dst
+    return nz
+end
+
+-- e.g. "08 Jul 2026, 3:45 PM NZST"
+local function nzFormat(epochMillis)
+    local nz = nzBreakdown(epochMillis)
+    local hour12 = nz.hour % 12
+    if hour12 == 0 then hour12 = 12 end
+    local ampm = nz.hour < 12 and "AM" or "PM"
+    local label = nz.isDST and "NZDT" or "NZST"
+    return string.format("%02d %s %04d, %d:%02d %s %s",
+        nz.day, MONTH_NAMES[nz.month], nz.year, hour12, nz.min, ampm, label)
+end
+
+local function timeAgo(epochMillis)
+    local diffSec = math.floor((epochMs() - epochMillis) / 1000)
+    if diffSec < 5 then return "just now" end
+    if diffSec < 60 then return diffSec .. "s ago" end
+    local mins = math.floor(diffSec / 60)
+    if mins < 60 then return mins .. "m ago" end
+    local hours = math.floor(mins / 60)
+    if hours < 24 then return hours .. "h ago" end
+    return math.floor(hours / 24) .. "d ago"
+end
+
+-- ===================== SESSION FILE PERSISTENCE =====================
+local function ensureDir(path)
+    if not fs.exists(path) then fs.makeDir(path) end
+end
+
+local function playerDir(name)
+    ensureDir(DATA_DIR)
+    local dir = DATA_DIR .. "/" .. name
+    ensureDir(dir)
+    return dir
+end
+
+local function indexPath(name) return playerDir(name) .. "/index.txt" end
+local function sessionPath(name, id) return playerDir(name) .. "/" .. id .. ".txt" end
+
+local function loadIndex(name)
+    local path = indexPath(name)
+    if not fs.exists(path) then return {} end
+    local f = fs.open(path, "r")
+    local contents = f.readAll()
+    f.close()
+    local ok, result = pcall(textutils.unserialize, contents)
+    if ok and result then return result end
+    return {}
+end
+
+local function saveIndex(name, idx)
+    local f = fs.open(indexPath(name), "w")
+    f.write(textutils.serialize(idx))
+    f.close()
+end
+
+local function upsertIndexEntry(name, entry)
+    local idx = loadIndex(name)
+    local found = false
+    for i, e in ipairs(idx) do
+        if e.id == entry.id then idx[i] = entry; found = true; break end
+    end
+    if not found then table.insert(idx, entry) end
+    saveIndex(name, idx)
+end
+
+local function persistSession(name, s)
+    local data = {
+        id = s.id, startTime = s.startTime, lastUpdate = s.lastUpdate, live = s.active,
+        minX = s.minX, maxX = s.maxX, minZ = s.minZ, maxZ = s.maxZ,
+        grid = s.grid, maxCount = s.maxCount,
+    }
+    local f = fs.open(sessionPath(name, s.id), "w")
+    f.write(textutils.serialize(data))
+    f.close()
+    upsertIndexEntry(name, { id = s.id, startTime = s.startTime, lastUpdate = s.lastUpdate, live = s.active })
+end
+
+local function loadSessionData(name, id)
+    local path = sessionPath(name, id)
+    if not fs.exists(path) then return nil end
+    local f = fs.open(path, "r")
+    local contents = f.readAll()
+    f.close()
+    local ok, result = pcall(textutils.unserialize, contents)
+    if ok then return result end
+    return nil
+end
+
+-- ===================== PLAYER DETECTOR HELPERS =====================
 local function tryGetPos(name)
     local ok, result = pcall(function() return pd.getPlayerPos(name) end)
     if not ok or not result then return nil end
@@ -613,17 +711,25 @@ local function tryGetPos(name)
     return nil
 end
 
--- A session holds everything needed to track + render one player's heatmap.
---   grid[col][row]  = visit count at that sub-pixel (sparse)
---   maxCount        = highest count currently in the grid (for color scale)
---   dirty           = list of {col=,row=} cells changed since last flush
---   samples         = capped raw (x,z) history, only replayed on rescale
---   needsRescale    = true if the bounding box grew and a full grid
---                     rebuild is owed (deferred to next render pass)
---   needsFullRecolor= true if the on-screen canvas needs a full repaint
---                     (after a rescale, or on the periodic timer)
+local function getOnlinePlayerNames()
+    local ok, result = pcall(function() return pd.getOnlinePlayers() end)
+    if not ok or not result then return {} end
+    -- Some AP versions return a list of names, others a list of tables.
+    local names = {}
+    for _, entry in ipairs(result) do
+        if type(entry) == "string" then
+            table.insert(names, entry)
+        elseif type(entry) == "table" and entry.name then
+            table.insert(names, entry.name)
+        end
+    end
+    return names
+end
+
+-- ===================== SESSION (GRID) LOGIC =====================
 local function newSession()
     return {
+        id = nil, startTime = nil, lastUpdate = nil,
         active = false,
         minX = nil, maxX = nil, minZ = nil, maxZ = nil,
         hasPoint = false,
@@ -643,7 +749,6 @@ local function ensureSession(name)
     return sessions[name]
 end
 
--- Map a world coordinate to a sub-pixel cell using a session's CURRENT bounds.
 local function worldToCell(s, x, z)
     local col, row
     if s.maxX == s.minX then
@@ -654,7 +759,6 @@ local function worldToCell(s, x, z)
     if s.maxZ == s.minZ then
         row = math.ceil(GRID_H / 2)
     else
-        -- flip Z so max Z (top-right requirement) ends up at the top row
         row = 1 + math.floor((s.maxZ - z) / (s.maxZ - s.minZ) * (GRID_H - 1) + 0.5)
     end
     if col < 1 then col = 1 elseif col > GRID_W then col = GRID_W end
@@ -662,9 +766,6 @@ local function worldToCell(s, x, z)
     return col, row
 end
 
--- Bump one grid cell's visit count. trackDirty=false is used during a full
--- rescale rebuild, since the whole canvas gets repainted afterward anyway -
--- no point building a dirty list nobody will read.
 local function incrementCell(s, col, row, trackDirty)
     local column = s.grid[col]
     if not column then column = {}; s.grid[col] = column end
@@ -678,10 +779,6 @@ local function incrementCell(s, col, row, trackDirty)
     end
 end
 
--- Exact connected line between two grid cells (Bresenham). This is what
--- makes fast movement between polls still read as a continuous trail,
--- and it's drawn directly in grid-space so its cost is proportional to
--- how far the point moved on screen, not to how much history exists.
 local function bresenhamLine(s, col0, row0, col1, row1, trackDirty)
     local dx = math.abs(col1 - col0)
     local dy = -math.abs(row1 - row0)
@@ -700,17 +797,12 @@ end
 
 local function colorFor(count, maxCount)
     if count == 0 or maxCount == 0 then return EMPTY_COLOR end
-    local intensity = count / maxCount
+    local intensity = (count / maxCount) ^ GRADIENT_GAMMA
     local idx = math.ceil(intensity * #GRADIENT)
     if idx < 1 then idx = 1 elseif idx > #GRADIENT then idx = #GRADIENT end
     return GRADIENT[idx]
 end
 
--- Full rebuild of a session's grid from its raw sample history, using the
--- session's CURRENT (possibly just-expanded) bounds. Only called when the
--- bounding box actually grew - this is the "expensive" path, but it's rare
--- and deferred to render time so a burst of expansion in one poll doesn't
--- trigger repeated rebuilds.
 local function rescaleSession(s)
     s.grid = {}
     s.maxCount = 0
@@ -719,10 +811,9 @@ local function rescaleSession(s)
     s.lastCol, s.lastRow = nil, nil
 
     local samples = s.samples
-    local n = #samples
     local prevCol, prevRow, prevX, prevZ
 
-    for i = 1, n do
+    for i = 1, #samples do
         local p = samples[i]
         local col, row = worldToCell(s, p.x, p.z)
         if prevCol then
@@ -744,10 +835,6 @@ local function rescaleSession(s)
     s.needsFullRecolor = true
 end
 
--- Record one new position for a player. Cheap in the common case (bounds
--- unchanged): just draws a line from the last point to this one. Only
--- flags a rescale (deferred, batched) when the player has wandered outside
--- the previously-seen area.
 local function recordSample(name, x, z)
     local s = ensureSession(name)
     local firstPoint = not s.hasPoint
@@ -768,8 +855,7 @@ local function recordSample(name, x, z)
     end
 
     if expanded then
-        s.needsRescale = true -- replay everything (including this point)
-                               -- on the next render pass
+        s.needsRescale = true
     elseif not s.needsRescale then
         local col, row = worldToCell(s, x, z)
         if s.lastCol then
@@ -785,22 +871,18 @@ local function recordSample(name, x, z)
         end
         s.lastCol, s.lastRow = col, row
     end
-    -- if a rescale is already pending, skip the incremental draw entirely -
-    -- the rescale will replay every sample (including this one) at once
 
     s.hasPoint = true
     s.lastX, s.lastZ = x, z
 end
 
 -- ===================== RENDERING =====================
-local function fullRecolor(name)
-    local s = sessions[name]
+local function fullRecolor(s)
     if not s or not s.hasPoint then
         box:clear(EMPTY_COLOR)
         box:render()
         return
     end
-
     for col = 1, GRID_W do
         local column = s.grid[col]
         for row = 1, GRID_H do
@@ -808,32 +890,41 @@ local function fullRecolor(name)
             box.canvas[row][col] = colorFor(count, s.maxCount)
         end
     end
-
     s.dirty = {}
     s.dirtyCount = 0
     s.needsFullRecolor = false
     box:render()
 end
 
--- Repaint only the cells that changed since the last frame. Returns true
--- if anything was actually repainted (so the caller knows to blit).
-local function flushDirty(name)
-    local s = sessions[name]
+local function flushDirty(s)
     if not s or s.dirtyCount == 0 then return false end
-
     for i = 1, s.dirtyCount do
         local d = s.dirty[i]
         local column = s.grid[d.col]
         local count = column and column[d.row] or 0
         box.canvas[d.row][d.col] = colorFor(count, s.maxCount)
     end
-
     s.dirty = {}
     s.dirtyCount = 0
     return true
 end
 
--- Convert a sub-pixel cell back into approximate world coordinates.
+local function renderStatic(data)
+    if not data or not data.grid then
+        box:clear(EMPTY_COLOR)
+        box:render()
+        return
+    end
+    for col = 1, GRID_W do
+        local column = data.grid[col]
+        for row = 1, GRID_H do
+            local count = column and column[row] or 0
+            box.canvas[row][col] = colorFor(count, data.maxCount)
+        end
+    end
+    box:render()
+end
+
 local function cellToWorld(s, col, row)
     local x, z
     if s.maxX == s.minX then
@@ -849,13 +940,11 @@ local function cellToWorld(s, col, row)
     return math.floor(x + 0.5), math.floor(z + 0.5)
 end
 
--- A monitor_touch event only gives us a character cell, which covers a
--- 2 (wide) x 3 (tall) block of sub-pixels. Report whichever of those
--- six was visited most, falling back to the cell's center if empty.
+-- A touch only gives a character cell (2x3 sub-pixels). Report whichever
+-- of those six was visited most, falling back to the cell's center.
 local function touchToCoords(s, charX, charY)
     local colStart = (charX - 1) * 2 + 1
     local rowStart = (charY - 1) * 3 + 1
-
     local bestCol, bestRow, bestCount = colStart, rowStart, -1
     for dc = 0, 1 do
         for dr = 0, 2 do
@@ -870,8 +959,139 @@ local function touchToCoords(s, charX, charY)
             end
         end
     end
-
     return cellToWorld(s, bestCol, bestRow)
+end
+
+-- ===================== SESSION LIFECYCLE =====================
+local function createSession(name)
+    local s = newSession()
+    s.id = epochMs()
+    s.startTime = s.id
+    s.lastUpdate = s.id
+    s.active = true
+    sessions[name] = s
+    persistSession(name, s) -- so it shows up in the session list immediately
+    return s
+end
+
+local function finalizeSession(name)
+    local s = sessions[name]
+    if s and s.active then
+        if s.needsRescale then rescaleSession(s) end
+        s.active = false
+        s.lastUpdate = epochMs()
+        persistSession(name, s)
+    end
+end
+
+-- ===================== ON-MONITOR UI =====================
+local function clearHeader()
+    mon.setBackgroundColor(colors.black)
+end
+
+local function renderPlayerPicker()
+    mon.setBackgroundColor(colors.black)
+    mon.clear()
+    mon.setTextColor(colors.white)
+    mon.setCursorPos(1, 1)
+    mon.write("Tracked players (tap to view):")
+
+    local clickable = {}
+    local names = {}
+    for n in pairs(players) do table.insert(names, n) end
+    table.sort(names)
+
+    local row = 3
+    for _, n in ipairs(names) do
+        local s = sessions[n]
+        mon.setCursorPos(2, row)
+        if s and s.active then
+            mon.setTextColor(colors.red)
+            mon.write(n .. "  LIVE")
+        else
+            mon.setTextColor(colors.white)
+            mon.write(n)
+        end
+        clickable[row] = { action = "player", name = n }
+        row = row + 1
+    end
+
+    if #names == 0 then
+        mon.setCursorPos(2, row)
+        mon.setTextColor(colors.gray)
+        mon.write("(none - use 'add <name>' first)")
+    end
+
+    uiState = { mode = "picker", clickable = clickable }
+end
+
+local function renderSessionPicker(name)
+    mon.setBackgroundColor(colors.black)
+    mon.clear()
+    mon.setTextColor(colors.white)
+    mon.setCursorPos(1, 1)
+    mon.write("< Back   Sessions: " .. name)
+
+    local clickable = { [1] = { action = "back_to_picker" } }
+    local idx = loadIndex(name)
+    table.sort(idx, function(a, b) return a.lastUpdate > b.lastUpdate end)
+
+    local row = 3
+    for _, entry in ipairs(idx) do
+        mon.setCursorPos(2, row)
+        local isLive = entry.live and sessions[name] and sessions[name].id == entry.id and sessions[name].active
+        if isLive then
+            mon.setTextColor(colors.red)
+            mon.write("LIVE *  " .. nzFormat(sessions[name].lastUpdate))
+        else
+            mon.setTextColor(colors.lightGray)
+            mon.write(timeAgo(entry.lastUpdate) .. "  -  " .. nzFormat(entry.lastUpdate))
+        end
+        clickable[row] = { action = "session", name = name, entry = entry }
+        row = row + 1
+    end
+
+    if #idx == 0 then
+        mon.setCursorPos(2, row)
+        mon.setTextColor(colors.gray)
+        mon.write("(no sessions recorded yet)")
+    end
+
+    uiState = { mode = "sessions", player = name, clickable = clickable }
+end
+
+local function enterHeatmapView(name, id, entry)
+    local live = sessions[name]
+    local isLive = live and live.id == id and live.active
+
+    if isLive then
+        if live.needsRescale then rescaleSession(live) end
+        fullRecolor(live)
+    else
+        local data = loadSessionData(name, id)
+        if not data then
+            renderSessionPicker(name)
+            return
+        end
+        renderStatic(data)
+    end
+
+    mon.setBackgroundColor(colors.black)
+    mon.setCursorPos(1, 1)
+    mon.clearLine()
+    if isLive then
+        mon.setTextColor(colors.red)
+        mon.write("< Back   " .. name .. "   LIVE * " .. nzFormat(live.lastUpdate))
+    else
+        mon.setTextColor(colors.lightGray)
+        local when = entry and entry.lastUpdate or epochMs()
+        mon.write("< Back   " .. name .. "   " .. nzFormat(when))
+    end
+
+    uiState = {
+        mode = "heatmap", player = name, sessionId = id, isLive = isLive,
+        clickable = { [1] = { action = "back_to_sessions" } },
+    }
 end
 
 -- ===================== POLLING =====================
@@ -879,9 +1099,14 @@ local function pollOnce()
     for name in pairs(players) do
         local s = ensureSession(name)
         local x, y, z = tryGetPos(name)
-
         if x then
-            s.active = true
+            if not s.active then
+                -- was tracked but had no live session (e.g. added while
+                -- offline, or script restarted while they were offline
+                -- and they've since joined) - start one now.
+                createSession(name)
+                s = sessions[name]
+            end
             s.lastY = y
             recordSample(name, x, z)
         else
@@ -891,25 +1116,48 @@ local function pollOnce()
 end
 
 -- ===================== JOIN/LEAVE EVENTS =====================
--- player_detector fires these directly once connected, no wrap/find
--- needed for the events themselves. This gives us an exact, instant
--- moment to reset a session, rather than inferring it from a poll.
 local function joinLeaveLoop()
     while true do
         local event, username = os.pullEvent()
         if event == "playerJoin" and players[username] then
-            sessions[username] = newSession()
-            sessions[username].active = true
+            createSession(username)
             print(username .. " logged in - starting new heatmap session.")
-            if watchedPlayer == username then
-                fullRecolor(username)
+            if uiState.mode == "sessions" and uiState.player == username then
+                renderSessionPicker(username)
+            elseif uiState.mode == "picker" then
+                renderPlayerPicker()
             end
         elseif event == "playerLeave" and players[username] then
-            local s = sessions[username]
-            if s then s.active = false end
-            print(username .. " logged out - freezing heatmap.")
+            finalizeSession(username)
+            print(username .. " logged out - session saved.")
+            if uiState.mode == "heatmap" and uiState.player == username and uiState.isLive then
+                uiState.isLive = false -- freeze current view; data is already final
+            elseif uiState.mode == "sessions" and uiState.player == username then
+                renderSessionPicker(username)
+            elseif uiState.mode == "picker" then
+                renderPlayerPicker()
+            end
         elseif event == "hotspot_exit" then
             return
+        end
+    end
+end
+
+-- ===================== AUTOSAVE =====================
+local function autosaveLoop()
+    while true do
+        local timerId = os.startTimer(SESSION_SAVE_INTERVAL)
+        while true do
+            local event, id = os.pullEvent()
+            if event == "timer" and id == timerId then break
+            elseif event == "hotspot_exit" then return end
+        end
+        for name, s in pairs(sessions) do
+            if s.active then
+                if s.needsRescale then rescaleSession(s) end
+                s.lastUpdate = epochMs()
+                persistSession(name, s)
+            end
         end
     end
 end
@@ -926,13 +1174,23 @@ local function printStatus()
     end
 end
 
-local function watchPlayer(name)
-    watchedPlayer = name
-    local s = sessions[name]
-    if s and s.needsRescale then
-        rescaleSession(s)
+local function addPlayer(name)
+    players[name] = true
+    local x = tryGetPos(name)
+    if x and (not sessions[name] or not sessions[name].active) then
+        createSession(name)
     end
-    fullRecolor(name)
+end
+
+local function removePlayer(name)
+    finalizeSession(name)
+    players[name] = nil
+    sessions[name] = nil
+    if uiState.player == name then
+        uiState = { mode = "none", clickable = {} }
+        mon.setBackgroundColor(colors.black)
+        mon.clear()
+    end
 end
 
 local function handleCommand(line)
@@ -941,45 +1199,81 @@ local function handleCommand(line)
     local cmd = args[1]
 
     if cmd == "add" and args[2] then
-        players[args[2]] = true
-        ensureSession(args[2])
-        savePlayers()
-        print("Now tracking " .. args[2])
+        if args[2] == "*" then
+            local online = getOnlinePlayerNames()
+            local added = 0
+            for _, uname in ipairs(online) do
+                if not players[uname] then added = added + 1 end
+                addPlayer(uname)
+            end
+            savePlayers()
+            print("Tracking " .. added .. " newly added player(s); " .. #online .. " online total.")
+        else
+            addPlayer(args[2])
+            savePlayers()
+            print("Now tracking " .. args[2])
+        end
 
     elseif cmd == "remove" and args[2] then
-        players[args[2]] = nil
-        sessions[args[2]] = nil
-        if watchedPlayer == args[2] then
-            watchedPlayer = nil
-            box:clear(EMPTY_COLOR)
-            box:render()
+        if args[2] == "*" then
+            local names = {}
+            for n in pairs(players) do table.insert(names, n) end
+            for _, n in ipairs(names) do removePlayer(n) end
+            savePlayers()
+            print("Stopped tracking all players (" .. #names .. ").")
+        else
+            removePlayer(args[2])
+            savePlayers()
+            print("Stopped tracking " .. args[2])
         end
-        savePlayers()
-        print("Stopped tracking " .. args[2])
 
     elseif cmd == "list" then
         local any = false
         for name in pairs(players) do
             any = true
-            print(" - " .. name .. (watchedPlayer == name and "  [watched]" or ""))
+            local s = sessions[name]
+            print(" - " .. name .. ((s and s.active) and "  [LIVE]" or ""))
         end
         if not any then print("No players tracked yet.") end
 
-    elseif cmd == "watch" and args[2] then
-        if not players[args[2]] then
-            print(args[2] .. " isn't tracked. Use 'add' first.")
+    elseif cmd == "watch" then
+        if args[2] then
+            if not players[args[2]] then
+                print(args[2] .. " isn't tracked. Use 'add' first.")
+            else
+                renderSessionPicker(args[2])
+            end
         else
-            watchPlayer(args[2])
-            print("Watching " .. args[2] .. " on the monitor.")
+            renderPlayerPicker()
+        end
+
+    elseif cmd == "back" then
+        if uiState.mode == "heatmap" then
+            renderSessionPicker(uiState.player)
+        elseif uiState.mode == "sessions" then
+            renderPlayerPicker()
+        else
+            print("Nothing to go back to.")
         end
 
     elseif cmd == "status" then
         printStatus()
 
     elseif cmd == "reset" and args[2] then
-        sessions[args[2]] = newSession()
-        if watchedPlayer == args[2] then fullRecolor(args[2]) end
-        print("Cleared session data for " .. args[2])
+        local old = sessions[args[2]]
+        if old then
+            local s = newSession()
+            s.id, s.startTime, s.active = old.id, old.startTime, old.active
+            s.lastUpdate = epochMs()
+            sessions[args[2]] = s
+            persistSession(args[2], s)
+            if uiState.mode == "heatmap" and uiState.player == args[2] and uiState.isLive then
+                fullRecolor(s)
+            end
+            print("Cleared current session data for " .. args[2])
+        else
+            print(args[2] .. " has no session loaded.")
+        end
 
     elseif cmd == "exit" or cmd == "quit" then
         savePlayers()
@@ -987,7 +1281,7 @@ local function handleCommand(line)
         return false
 
     elseif cmd == "help" then
-        print("Commands: add <n> | remove <n> | list | watch <n> | status | reset <n> | exit")
+        print("Commands: add <n>|* | remove <n>|* | list | watch [n] | back | status | reset <n> | exit")
 
     else
         print("Unknown command. Type 'help' for a list of commands.")
@@ -1009,50 +1303,37 @@ local function commandLoop()
     end
 end
 
--- Fast loop: just updates position data + grid. No monitor writes here.
 local function pollLoop()
     while true do
         local timerId = os.startTimer(POLL_INTERVAL)
         while true do
             local event, id = os.pullEvent()
-            if event == "timer" and id == timerId then
-                break
-            elseif event == "hotspot_exit" then
-                return
-            end
+            if event == "timer" and id == timerId then break
+            elseif event == "hotspot_exit" then return end
         end
         pollOnce()
     end
 end
 
--- Slower loop: the only place that touches the monitor. Applies any
--- pending rescale, then either does a full recolor (periodically, or if
--- one was just triggered by a rescale) or a cheap dirty-cell-only repaint.
 local function renderLoop()
     local sinceFullRecolor = 0
     while true do
         local timerId = os.startTimer(RENDER_INTERVAL)
         while true do
             local event, id = os.pullEvent()
-            if event == "timer" and id == timerId then
-                break
-            elseif event == "hotspot_exit" then
-                return
-            end
+            if event == "timer" and id == timerId then break
+            elseif event == "hotspot_exit" then return end
         end
 
-        if watchedPlayer then
-            local s = sessions[watchedPlayer]
-            if s then
-                if s.needsRescale then
-                    rescaleSession(s)
-                end
-
+        if uiState.mode == "heatmap" and uiState.isLive then
+            local s = sessions[uiState.player]
+            if s and s.active then
+                if s.needsRescale then rescaleSession(s) end
                 sinceFullRecolor = sinceFullRecolor + RENDER_INTERVAL
                 if s.needsFullRecolor or sinceFullRecolor >= FULL_RECOLOR_INTERVAL then
-                    fullRecolor(watchedPlayer)
+                    fullRecolor(s)
                     sinceFullRecolor = 0
-                elseif flushDirty(watchedPlayer) then
+                elseif flushDirty(s) then
                     box:render()
                 end
             end
@@ -1063,14 +1344,38 @@ end
 local function touchLoop()
     while true do
         local event, side, tx, ty = os.pullEvent("monitor_touch")
-        if watchedPlayer then
-            local s = sessions[watchedPlayer]
-            if s and s.hasPoint then
-                local x, z = touchToCoords(s, tx, ty)
-                print(string.format(
-                    "Clicked (%d,%d) -> approx coords: X=%d Z=%d (%s)",
-                    tx, ty, x, z, watchedPlayer
-                ))
+
+        if uiState.mode == "picker" then
+            local action = uiState.clickable[ty]
+            if action and action.action == "player" then
+                renderSessionPicker(action.name)
+            end
+
+        elseif uiState.mode == "sessions" then
+            local action = uiState.clickable[ty]
+            if action then
+                if action.action == "back_to_picker" then
+                    renderPlayerPicker()
+                elseif action.action == "session" then
+                    enterHeatmapView(action.name, action.entry.id, action.entry)
+                end
+            end
+
+        elseif uiState.mode == "heatmap" then
+            if ty == 1 then
+                renderSessionPicker(uiState.player)
+            else
+                local s
+                if uiState.isLive then
+                    s = sessions[uiState.player]
+                else
+                    s = loadSessionData(uiState.player, uiState.sessionId)
+                end
+                if s then
+                    local charY = ty - 1
+                    local x, z = touchToCoords(s, tx, charY)
+                    print(string.format("Clicked -> approx X=%d Z=%d (%s)", x, z, uiState.player))
+                end
             end
         end
     end
@@ -1078,9 +1383,18 @@ end
 
 -- ===================== MAIN =====================
 players = loadPlayers()
-for name in pairs(players) do ensureSession(name) end
+for name in pairs(players) do
+    ensureSession(name)
+    local x = tryGetPos(name)
+    if x then
+        createSession(name) -- always a fresh session on script start if found online
+    end
+end
 
-box:clear(EMPTY_COLOR)
-box:render()
+mon.setBackgroundColor(colors.black)
+mon.clear()
+mon.setTextColor(colors.white)
+mon.setCursorPos(1, 1)
+mon.write("Type 'watch' to open the player picker.")
 
-parallel.waitForAny(commandLoop, pollLoop, renderLoop, touchLoop, joinLeaveLoop)
+parallel.waitForAny(commandLoop, pollLoop, renderLoop, touchLoop, joinLeaveLoop, autosaveLoop)
