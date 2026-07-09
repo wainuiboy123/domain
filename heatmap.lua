@@ -542,11 +542,12 @@ end
 
 mon.setTextScale(0.5) -- smallest scale = max character resolution
 
--- Row 1 of the monitor is permanently reserved for a header / back button,
--- in every mode (menus AND heatmaps), so navigation is always available.
--- The heatmap itself renders into a window covering the rest.
+-- The bottom row of the monitor is permanently reserved for a header /
+-- back button in heatmap mode (easier to reach than the top on a
+-- wall-mounted monitor). The heatmap itself renders into a window
+-- covering everything above that row.
 local MON_W, MON_H = mon.getSize()
-local heatmapWindow = window.create(mon, 1, 2, MON_W, MON_H - 1)
+local heatmapWindow = window.create(mon, 1, 1, MON_W, MON_H - 1)
 local box = pixelbox.new(heatmapWindow)
 local GRID_W, GRID_H = box.width, box.height
 
@@ -1027,7 +1028,9 @@ local function renderPlayerPicker()
     for n in pairs(players) do table.insert(names, n) end
     table.sort(names)
 
-    local row = 3
+    -- Anchored to the bottom and growing upward, so the buttons sit
+    -- within easy reach of a monitor mounted up high.
+    local row = MON_H
     for _, n in ipairs(names) do
         local s = sessions[n]
         mon.setCursorPos(2, row)
@@ -1039,7 +1042,7 @@ local function renderPlayerPicker()
             mon.write(n)
         end
         clickable[row] = { action = "player", name = n }
-        row = row + 1
+        row = row - 1
     end
 
     if #names == 0 then
@@ -1056,13 +1059,21 @@ local function renderSessionPicker(name)
     mon.clear()
     mon.setTextColor(colors.white)
     mon.setCursorPos(1, 1)
-    mon.write("< Back   Sessions: " .. name)
+    mon.write("Sessions: " .. name)
 
-    local clickable = { [1] = { action = "back_to_picker" } }
+    local clickable = {}
+
+    -- Back button anchored at the very bottom row - the single easiest
+    -- spot to reach on a wall-mounted monitor.
+    mon.setCursorPos(2, MON_H)
+    mon.setTextColor(colors.orange)
+    mon.write("< Back")
+    clickable[MON_H] = { action = "back_to_picker" }
+
     local idx = loadIndex(name)
     table.sort(idx, function(a, b) return a.lastUpdate > b.lastUpdate end)
 
-    local row = 3
+    local row = MON_H - 1
     for _, entry in ipairs(idx) do
         mon.setCursorPos(2, row)
         local isLive = entry.live and sessions[name] and sessions[name].id == entry.id and sessions[name].active
@@ -1074,7 +1085,7 @@ local function renderSessionPicker(name)
             mon.write(timeAgo(entry.lastUpdate) .. "  -  " .. nzFormat(entry.lastUpdate))
         end
         clickable[row] = { action = "session", name = name, entry = entry }
-        row = row + 1
+        row = row - 1
     end
 
     if #idx == 0 then
@@ -1102,8 +1113,10 @@ local function enterHeatmapView(name, id, entry)
         renderStatic(data)
     end
 
+    -- Header/back button lives on the BOTTOM row (MON_H), reachable
+    -- without reaching up, while the heatmap fills rows 1..MON_H-1 above it.
     mon.setBackgroundColor(colors.black)
-    mon.setCursorPos(1, 1)
+    mon.setCursorPos(1, MON_H)
     mon.clearLine()
     if isLive then
         mon.setTextColor(colors.red)
@@ -1116,7 +1129,7 @@ local function enterHeatmapView(name, id, entry)
 
     uiState = {
         mode = "heatmap", player = name, sessionId = id, isLive = isLive,
-        clickable = { [1] = { action = "back_to_sessions" } },
+        clickable = { [MON_H] = { action = "back_to_sessions" } },
     }
 end
 
@@ -1398,7 +1411,7 @@ local function touchLoop()
             end
 
         elseif uiState.mode == "heatmap" then
-            if ty == 1 then
+            if ty == MON_H then
                 renderSessionPicker(uiState.player)
             else
                 local s
@@ -1408,7 +1421,7 @@ local function touchLoop()
                     s = loadSessionData(uiState.player, uiState.sessionId)
                 end
                 if s then
-                    local charY = ty - 1
+                    local charY = ty
                     local x, z = touchToCoords(s, tx, charY)
                     print(string.format("Clicked -> approx X=%d Z=%d (%s)", x, z, uiState.player))
                 end
