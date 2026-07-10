@@ -702,6 +702,36 @@ local function persistSession(name, s)
     upsertIndexEntry(name, { id = s.id, startTime = s.startTime, lastUpdate = s.lastUpdate, live = s.active })
 end
 
+-- Finds the (at most one, in normal operation) session still flagged
+-- "live" in a player's index - i.e. the session that was active at the
+-- moment the script last stopped without a clean logout.
+local function findLiveIndexEntry(name)
+    local idx = loadIndex(name)
+    for _, e in ipairs(idx) do
+        if e.live then return e end
+    end
+    return nil
+end
+
+-- If a player is offline right now but their index still shows a live
+-- session (script crashed/restarted while they were online, and they've
+-- since logged out for real before we came back up), that session was
+-- never properly finalized. Flip it closed so it doesn't sit there
+-- showing "LIVE" in the UI forever.
+local function closeDanglingLiveSessions(name)
+    local pdata = ensurePlayerData(name)
+    local closedAny = false
+    for _, e in ipairs(pdata.index) do
+        if e.live then
+            e.live = false
+            local raw = pdata.sessions[tostring(e.id)]
+            if raw then raw.live = false end
+            closedAny = true
+        end
+    end
+    return closedAny
+end
+
 local function loadSessionData(name, id)
     local pdata = ensurePlayerData(name)
     local raw = pdata.sessions[tostring(id)]
@@ -766,6 +796,15 @@ local function newSession()
         needsFullRecolor = false,
         lastX = nil, lastZ = nil, lastY = nil,
         lastCol = nil, lastRow = nil,
+        legacyGridLocked = false,
+            -- true only for sessions RESUMED from nbt_storage after a
+            -- restart (see the startup block). Their raw sample history
+            -- isn't persisted, only the aggregated grid - so for these we
+            -- refuse to expand the bounding box (which would trigger a
+            -- rescale that rebuilds purely from samples, wiping the
+            -- resumed grid). Points outside the old box just clamp to the
+            -- nearest edge instead. Fresh sessions never set this and
+            -- behave exactly as before.
     }
 end
 
@@ -867,12 +906,16 @@ local function recordSample(name, x, z)
 
     if firstPoint then
         s.minX, s.maxX, s.minZ, s.maxZ = x, x, z, z
-    else
+    elseif not s.legacyGridLocked then
         if x < s.minX then s.minX = x; expanded = true end
         if x > s.maxX then s.maxX = x; expanded = true end
         if z < s.minZ then s.minZ = z; expanded = true end
         if z > s.maxZ then s.maxZ = z; expanded = true end
     end
+    -- (a locked session just keeps its existing bounds; worldToCell()
+    -- already clamps out-of-range points to the nearest edge cell, so
+    -- points outside the old box still get recorded, just pinned to the
+    -- boundary rather than plotted at their true position)
 
     table.insert(s.samples, { x = x, z = z })
     if #s.samples > MAX_SAMPLES then
@@ -1432,13 +1475,57 @@ end
 
 -- ===================== MAIN =====================
 loadAll()
+
+-- On a clean run this loop does almost nothing (no live sessions to
+-- find). It only matters after a crash/restart while players were online:
+--   - if a tracked player is online RIGHT NOW and their index still shows
+--     a live session, that's almost certainly the same play session
+--     interrupted by the restart - resume it (keep its grid, its bounding
+--     box locked so old data can't be wiped, mark it active again) rather
+--     than starting a new one and losing everything since the last
+--     autosave.
+--   - if a tracked player is offline but their index still shows a live
+--     session, the script died mid-session and they've since logged off
+--     for real - close that stale "LIVE" flag out so the UI doesn't show
+--     it as live forever.
+--   - anyone with no live session at all (first run, or they simply
+--     aren't online) is left alone here; pollOnce()/joinLeaveLoop() will
+--     start a fresh session for them the normal way if/when they're seen.
 for name in pairs(players) do
-    ensureSession(name)
     local x = tryGetPos(name)
+
     if x then
-        createSession(name) -- always a fresh session on script start if found online
+        local liveEntry = findLiveIndexEntry(name)
+        if liveEntry then
+            local data = loadSessionData(name, liveEntry.id)
+            if data then
+                data.active = true
+                data.samples = {}
+                data.dirty, data.dirtyCount = {}, 0
+                data.needsRescale = false
+                data.needsFullRecolor = true
+                data.hasPoint = (data.minX ~= nil)
+                data.lastX, data.lastZ, data.lastY = nil, nil, nil
+                data.lastCol, data.lastRow = nil, nil
+                data.legacyGridLocked = true -- see note above newSession()
+                sessions[name] = data
+                print(name .. " already online - resuming their existing live session.")
+            else
+                ensureSession(name)
+                createSession(name)
+            end
+        else
+            ensureSession(name)
+            createSession(name)
+        end
+    else
+        ensureSession(name)
+        if closeDanglingLiveSessions(name) then
+            print(name .. " has a stale live session from a previous crash - marked closed.")
+        end
     end
 end
+saveAll() -- persist any dangling-session cleanup from the loop above
 
 mon.setBackgroundColor(colors.black)
 mon.clear()
