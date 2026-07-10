@@ -285,125 +285,70 @@ local function redrawLoop()
 end
 
 ------------------------------------------------------------
--- TEXT WRAPPING + PRINTING (same style as the print terminal system)
+-- REMOTE PRINT (hands the log off to print_terminal.lua, unencrypted -
+-- this uses that script's own protocol, separate from the cannon network)
 ------------------------------------------------------------
-local function wrapText(text, width)
-  local lines = {}
-  for rawLine in (text .. "\n"):gmatch("(.-)\n") do
-    if rawLine == "" then
-      table.insert(lines, "")
-    else
-      local buf = ""
-      for word in rawLine:gmatch("%S+") do
-        if #buf == 0 then
-          buf = word
-        elseif #buf + 1 + #word <= width then
-          buf = buf .. " " .. word
-        else
-          table.insert(lines, buf)
-          buf = word
-        end
-      end
-      table.insert(lines, buf)
-    end
-  end
-  return lines
-end
-
-local function getPageDims()
-  local ok, w, h = pcall(function() return printer.getPageSize() end)
-  if ok and w and h then return w, h end
-  return 25, 21
-end
-
 local function printLog()
-  if not printer then
-    print("No printer attached.")
-    return
-  end
   if #pendingLog == 0 then
     print("Nothing new to print.")
     return
   end
+  if not modem then
+    print("No ender modem - cannot send. (" .. #pendingLog .. " lines still saved locally.)")
+    return
+  end
+  if not printTarget then
+    print("No print target set. Use: settarget <computerID>")
+    print("(" .. #pendingLog .. " lines still saved locally, will be sent once a target is set.)")
+    return
+  end
 
   local content = table.concat(pendingLog, "\n")
-  local pageW, pageH = getPageDims()
-  local timeStr, dateStr = nzTime()
-  local docLabel = nextDocNum()
+  rednet.send(printTarget, { name = LOGGER_NAME, content = content }, PRINT_PROTOCOL)
 
-  local header1 = {
-    "Cannon Network Log",
-    "Sender Name: HQ System",
-    "Sender ID: " .. os.getComputerID(),
-    timeStr .. "  " .. dateStr .. " NZST",
-    docLabel,
-    string.rep("-", pageW),
-  }
-  local header2 = { docLabel, string.rep("-", pageW) }
-
-  local bodyLines = wrapText(content, pageW)
-  local pages = {}
-  local idx = 1
-  local firstSpace = math.max(0, pageH - #header1)
-  local otherSpace = math.max(1, pageH - #header2)
-
-  local firstChunk = {}
-  while idx <= #bodyLines and #firstChunk < firstSpace do
-    table.insert(firstChunk, bodyLines[idx]); idx = idx + 1
-  end
-  table.insert(pages, { header = header1, body = firstChunk })
-
-  while idx <= #bodyLines do
-    local chunk = {}
-    while idx <= #bodyLines and #chunk < otherSpace do
-      table.insert(chunk, bodyLines[idx]); idx = idx + 1
-    end
-    table.insert(pages, { header = header2, body = chunk })
-  end
-
-  for pNum, page in ipairs(pages) do
-    if not printer.newPage() then
-      print("Printer out of paper/ink, stopped partway.")
-      break
-    end
-    printer.setPageTitle(pNum == 1 and docLabel or (docLabel .. "-" .. pNum))
-    local y = 1
-    for _, line in ipairs(page.header) do
-      printer.setCursorPos(1, y); printer.write(line); y = y + 1
-    end
-    for _, line in ipairs(page.body) do
-      printer.setCursorPos(1, y); printer.write(line); y = y + 1
-    end
-    printer.endPage()
-  end
-
-  print(("Printed %s (%d page%s)."):format(docLabel, #pages, #pages == 1 and "" or "s"))
+  print(("Sent %d line(s) to computer #%d for printing."):format(#pendingLog, printTarget))
   pendingLog = {}
-  content = nil
+  content = nil -- scrub after send
 end
 
 ------------------------------------------------------------
 -- COMMAND LOOP
 ------------------------------------------------------------
 local function commandLoop()
-  print("HQ ready. Type 'print', 'status', 'help', or 'exit'.")
+  print("HQ ready. Type 'print', 'settarget <id>', 'status', 'help', or 'exit'.")
+  if not printTarget then
+    print("(No print target set yet - use 'settarget <computerID>')")
+  end
   while true do
     write("hq> ")
     local input = read()
-    if input == "print" then
+    local cmd, rest = (input or ""):match("^(%S*)%s*(.-)$")
+
+    if cmd == "print" then
       printLog()
-    elseif input == "status" then
+    elseif cmd == "settarget" then
+      local id = tonumber(rest)
+      if id then
+        printTarget = id
+        savePrintTarget(id)
+        print("Print target set to computer #" .. id)
+      else
+        print("Usage: settarget <computerID>")
+      end
+    elseif cmd == "status" then
       local count = 0
       for _ in pairs(cannons) do count = count + 1 end
       print("Tracking " .. count .. " cannon(s). " .. #pendingLog .. " log line(s) pending print.")
-    elseif input == "help" then
-      print("print   - send everything logged since the last print to the printer")
-      print("status  - show cannon count and pending log size")
-      print("exit    - stop the command loop (monitor/listener keep running)")
-    elseif input == "exit" then
+      print("Print target: " .. (printTarget and ("computer #" .. printTarget) or "not set"))
+    elseif cmd == "help" then
+      print("print              send everything logged since the last print")
+      print("settarget <id>     set which computer runs print_terminal.lua")
+      print("status             show cannon count and pending log size")
+      print("exit               stop the command loop (monitor/listener keep running)")
+    elseif cmd == "exit" then
       print("Command loop stopped.")
       return
-    elseif input ~= nil and input ~= "" then
+    elseif cmd ~= "" then
       print("Unknown command.")
     end
   end
