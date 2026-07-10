@@ -1,0 +1,270 @@
+--[[
+  DOCUMENT BINDER TURTLE
+  CC: Tweaked - NeoForge 1.21.1 - requires an ADVANCED CRAFTY TURTLE
+
+  Sits next to a chest containing loose "computercraft:printed_page" items
+  (and a supply of string). Reads each page's title (the "d.0001",
+  "d.0001-2" etc label your print terminal already stamps on every page),
+  groups pages by their base document number, sorts each group by
+  sub-page number, and crafts them together IN THAT ORDER - regardless of
+  what order they happen to sit in inside the chest.
+
+  Large documents (more than 8 sub-pages) are built up in batches, since
+  a crafting grid only has 9 usable slots and one of those has to be the
+  string.
+
+  ------------------------------------------------------------
+  SETUP - please read
+  ------------------------------------------------------------
+  1. Place the chest directly adjacent to the turtle.
+  2. Set CHEST_SIDE below to "front", "top", or "bottom" depending on
+     where the chest sits relative to the turtle.
+  3. If CHEST_SIDE is "front" (chest beside the turtle, not above/below),
+     you also need to set PUSH_DIRECTION to the real compass direction
+     FROM THE CHEST TOWARDS THE TURTLE (north/south/east/west). Easiest
+     way to find this: stand at the chest, open the F3 debug screen, and
+     look toward the turtle - the "Facing:" line tells you the direction.
+     (If CHEST_SIDE is "top" or "bottom" this is worked out for you.)
+  4. Keep a healthy stock of minecraft:string in the chest.
+]]--
+
+------------------------------------------------------------
+-- CONFIGURATION
+------------------------------------------------------------
+local CHEST_SIDE = "left"     -- "front", "top", or "bottom" (turtle-relative)
+local PUSH_DIRECTION = "north" -- only used/needed when CHEST_SIDE == "front"
+                                -- real compass direction, chest -> turtle
+
+local PAGE_ITEM   = "computercraft:printed_page"   -- single, uncombined page
+local PAGES_ITEM  = "computercraft:printed_pages"  -- combined multi-page document
+local STRING_ITEM = "minecraft:string"
+
+local SCAN_INTERVAL = 30 -- seconds between chest scans
+
+-- resolve real push direction automatically for vertical placements
+if CHEST_SIDE == "top" then
+  PUSH_DIRECTION = "down"
+elseif CHEST_SIDE == "bottom" then
+  PUSH_DIRECTION = "up"
+end
+
+------------------------------------------------------------
+-- TURTLE-RELATIVE HELPERS (for moving finished docs, not for targeted pulls)
+------------------------------------------------------------
+local function dropToChest(count)
+  if CHEST_SIDE == "top" then
+    return turtle.dropUp(count)
+  elseif CHEST_SIDE == "bottom" then
+    return turtle.dropDown(count)
+  else
+    return turtle.drop(count)
+  end
+end
+
+------------------------------------------------------------
+-- CRAFTING GRID LAYOUT
+-- A turtle's 3x3 crafting area uses inventory slots 1,2,3 / 5,6,7 / 9,10,11
+------------------------------------------------------------
+local GRID_SLOTS = { 1, 2, 3, 5, 6, 7, 9, 10, 11 }
+local HOLD_SLOT = 16 -- parking spot for an in-progress combined document
+local MAX_PAGES_PER_CRAFT = #GRID_SLOTS - 1 -- one grid slot always holds string
+
+------------------------------------------------------------
+-- TITLE PARSING: "d.0001" -> base="d.0001", sub=1
+--                "d.0001-2" -> base="d.0001", sub=2
+------------------------------------------------------------
+local function parseTitle(title)
+  if not title then return nil, nil end
+  local base, sub = title:match("^(d%.%d%d%d%d)%-(%d+)$")
+  if base then
+    return base, tonumber(sub)
+  end
+  base = title:match("^(d%.%d%d%d%d)$")
+  if base then
+    return base, 1
+  end
+  return nil, nil
+end
+
+------------------------------------------------------------
+-- CHEST SCAN: group loose pages by base document number
+------------------------------------------------------------
+local function scanChest(chest)
+  local items = chest.list()
+  local groups = {} -- groups[base] = { {sub=n, slot=s}, ... }
+
+  for slot, item in pairs(items) do
+    if item.name == PAGE_ITEM then
+      local detail = chest.getItemDetail(slot, true)
+      local title = detail and detail.displayName
+      local base, sub = parseTitle(title)
+      if base then
+        groups[base] = groups[base] or {}
+        table.insert(groups[base], { sub = sub, slot = slot })
+      else
+        print("Skipping unrecognised page title in slot " .. slot .. ": " .. tostring(title))
+      end
+    end
+  end
+
+  for _, list in pairs(groups) do
+    table.sort(list, function(a, b) return a.sub < b.sub end)
+  end
+
+  return groups
+end
+
+------------------------------------------------------------
+-- Find a slot in the chest containing string
+------------------------------------------------------------
+local function findString(chest)
+  local items = chest.list()
+  for slot, item in pairs(items) do
+    if item.name == STRING_ITEM and item.count > 0 then
+      return slot
+    end
+  end
+  return nil
+end
+
+------------------------------------------------------------
+-- Pull one specific chest slot's item into a specific turtle slot
+------------------------------------------------------------
+local function pullInto(chest, chestSlot, turtleSlot)
+  return chest.pushItems(PUSH_DIRECTION, chestSlot, 1, turtleSlot) > 0
+end
+
+------------------------------------------------------------
+-- Find which turtle slot now holds the freshly crafted combined document
+------------------------------------------------------------
+local function findCraftedResultSlot()
+  for slot = 1, 16 do
+    local detail = turtle.getItemDetail(slot)
+    if detail and detail.name == PAGES_ITEM then
+      return slot
+    end
+  end
+  return nil
+end
+
+------------------------------------------------------------
+-- Empty any stray items left in the turtle back into the chest
+------------------------------------------------------------
+local function returnStrayItemsToChest()
+  for slot = 1, 16 do
+    if turtle.getItemCount(slot) > 0 then
+      turtle.select(slot)
+      dropToChest()
+    end
+  end
+  turtle.select(1)
+end
+
+------------------------------------------------------------
+-- CRAFT ONE DOCUMENT (may take several batches for large documents)
+------------------------------------------------------------
+local function craftDocument(chest, base, pages)
+  print(("Binding %s (%d page%s)..."):format(base, #pages, #pages == 1 and "" or "s"))
+
+  local index = 1
+  local carrySlot = nil -- turtle slot holding the in-progress combined doc, if any
+
+  while index <= #pages do
+    local gridPointer = 1
+
+    -- place string in the first grid slot
+    local stringSlot = findString(chest)
+    if not stringSlot then
+      print("Out of string in the chest - stopping. Restock and try again.")
+      returnStrayItemsToChest()
+      return false
+    end
+    turtle.select(GRID_SLOTS[gridPointer])
+    if not pullInto(chest, stringSlot, GRID_SLOTS[gridPointer]) then
+      print("Failed to pull string, aborting this document.")
+      returnStrayItemsToChest()
+      return false
+    end
+    gridPointer = gridPointer + 1
+
+    -- carry the in-progress document into the grid first, so it stays "first"
+    if carrySlot then
+      turtle.select(carrySlot)
+      turtle.transferTo(GRID_SLOTS[gridPointer])
+      gridPointer = gridPointer + 1
+    end
+
+    -- fill remaining grid slots with the next pages in sorted order
+    while gridPointer <= #GRID_SLOTS and index <= #pages do
+      local page = pages[index]
+      turtle.select(GRID_SLOTS[gridPointer])
+      if not pullInto(chest, page.slot, GRID_SLOTS[gridPointer]) then
+        print("Failed to pull a page (slot " .. page.slot .. "), aborting this document.")
+        returnStrayItemsToChest()
+        return false
+      end
+      gridPointer = gridPointer + 1
+      index = index + 1
+    end
+
+    turtle.select(1)
+    local ok, err = turtle.craft()
+    if not ok then
+      print("Craft failed for " .. base .. ": " .. tostring(err))
+      returnStrayItemsToChest()
+      return false
+    end
+
+    local resultSlot = findCraftedResultSlot()
+    if not resultSlot then
+      print("Couldn't find the crafted result for " .. base .. " - check turtle inventory manually.")
+      return false
+    end
+
+    -- park it out of the way of the grid for the next batch
+    turtle.select(resultSlot)
+    turtle.transferTo(HOLD_SLOT)
+    carrySlot = HOLD_SLOT
+  end
+
+  -- finished - drop the completed document back in the chest
+  turtle.select(carrySlot)
+  dropToChest()
+  turtle.select(1)
+
+  print(base .. " bound successfully.")
+  return true
+end
+
+------------------------------------------------------------
+-- MAIN LOOP
+------------------------------------------------------------
+local function processChest()
+  local chest = peripheral.wrap(CHEST_SIDE)
+  if not chest then
+    print("No chest found on side: " .. CHEST_SIDE)
+    return
+  end
+
+  local groups = scanChest(chest)
+  local didWork = false
+
+  for base, pages in pairs(groups) do
+    if #pages >= 2 then
+      didWork = true
+      craftDocument(chest, base, pages)
+    end
+  end
+
+  if not didWork then
+    print("Nothing to bind right now.")
+  end
+end
+
+print("Document Binder Turtle running. Scanning every " .. SCAN_INTERVAL .. "s.")
+returnStrayItemsToChest() -- start with a clean inventory
+
+while true do
+  processChest()
+  os.sleep(SCAN_INTERVAL)
+end
