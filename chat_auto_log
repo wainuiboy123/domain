@@ -1,0 +1,223 @@
+
+
+
+local LOG_FILE       = "activity_log.txt"  
+local TARGET_FILE    = ".print_target"
+local PROTOCOL       = "advcomp_print"      
+local FLUSH_INTERVAL = 300                  
+local LOGGER_NAME    = "Server Activity Logger" 
+local NZ_OFFSET_SECONDS = 12 * 3600     
+
+local chatBox = peripheral.find("chat_box")
+local playerDetector = peripheral.find("player_detector")
+local modem = peripheral.find("modem", function(_, p)
+  return p.isWireless and p.isWireless()
+end)
+
+if not chatBox then
+  printError("[!] No chatBox found - chat messages will not be captured.")
+end
+if not playerDetector then
+  printError("[!] No playerDetector found - join/leave will not be captured.")
+end
+if not modem then
+  printError("[!] No ender modem found - logs will save locally but cannot be sent.")
+else
+  rednet.open(peripheral.getName(modem))
+end
+
+local function loadTarget()
+  if fs.exists(TARGET_FILE) then
+    local f = fs.open(TARGET_FILE, "r")
+    local id = tonumber(f.readAll())
+    f.close()
+    return id
+  end
+  return nil
+end
+
+local function saveTarget(id)
+  local f = fs.open(TARGET_FILE, "w")
+  f.write(tostring(id))
+  f.close()
+end
+
+local printerTarget = loadTarget()
+
+
+
+local function nzTime()
+  local utcSeconds = math.floor(os.epoch("utc") / 1000)
+  local nzSeconds = utcSeconds + NZ_OFFSET_SECONDS
+  return os.date("!%H:%M:%S", nzSeconds), os.date("!%d/%m/%y", nzSeconds)
+end
+
+
+local pending = {}
+
+local function recordLine(line)
+  local t = nzTime()
+  local full = "[" .. t .. "] " .. line
+
+
+  local f = fs.open(LOG_FILE, "a")
+  f.write(full .. "\n")
+  f.close()
+
+
+  table.insert(pending, full)
+
+  print(full)
+end
+
+
+local lastFlush = os.time()
+
+local function flush(manual)
+  if #pending == 0 then
+    if manual then print("Nothing new to print.") end
+    return
+  end
+
+  if not modem then
+    print("No ender modem - cannot send. (" .. #pending .. " lines still saved locally.)")
+    return
+  end
+
+  if not printerTarget then
+    print("No print target set. Use: settarget <computerID>")
+    print("(" .. #pending .. " lines still saved locally, will be sent once a target is set.)")
+    return
+  end
+
+  local content = table.concat(pending, "\n")
+  rednet.send(printerTarget, { name = LOGGER_NAME, content = content }, PROTOCOL)
+
+  print(("Sent %d line(s) to computer #%d."):format(#pending, printerTarget))
+  pending = {}
+  content = nil
+  lastFlush = os.time()
+end
+
+
+local function cmdHelp()
+  print("Available commands:")
+  print("  print              send everything pending to the print terminal now")
+  print("  settarget <id>     set which computer runs print_terminal.lua")
+  print("  status             show peripheral + logger status")
+  print("  recent [n]         show the last n lines of the local log (default 20)")
+  print("  debug              print the raw fields of the next captured event")
+  print("  clear              clear this terminal's screen")
+  print("  help               show this help")
+  print("  exit               stop the program")
+end
+
+local function cmdStatus()
+  print("=== Status ===")
+  print("Chat Box:        " .. (chatBox and "connected" or "MISSING"))
+  print("Player Detector: " .. (playerDetector and "connected" or "MISSING"))
+  print("Ender Modem:     " .. (modem and "connected" or "MISSING"))
+  print("Print target:    " .. (printerTarget and ("computer #" .. printerTarget) or "not set"))
+  print("Pending lines:   " .. #pending)
+  local t, d = nzTime()
+  print("NZ time now:     " .. t .. "  " .. d)
+  print("Next auto-send:  in ~" .. math.max(0, FLUSH_INTERVAL - (os.time() - lastFlush)) .. "s (approx)")
+end
+
+local function cmdRecent(n)
+  n = tonumber(n) or 20
+  if not fs.exists(LOG_FILE) then
+    print("No log entries yet.")
+    return
+  end
+  local f = fs.open(LOG_FILE, "r")
+  local raw = f.readAll()
+  f.close()
+  local lines = {}
+  for line in raw:gmatch("[^\n]+") do table.insert(lines, line) end
+  local startIdx = math.max(1, #lines - n + 1)
+  for i = startIdx, #lines do print(lines[i]) end
+end
+
+local debugNext = false
+local function cmdDebug()
+  debugNext = true
+  print("Debug armed - the next chat/join/leave event will print its raw fields.")
+end
+
+local running = true
+
+local function commandLoop()
+  print("Activity Logger ready. Type 'help' for commands.")
+  if not printerTarget then
+    print("(No print target set yet - use 'settarget <computerID>')")
+  end
+  while running do
+    write("logger> ")
+    local input = read()
+    if input then
+      local cmd, rest = input:match("^(%S*)%s*(.-)$")
+      cmd = (cmd or ""):lower()
+
+      if cmd == "print" then
+        flush(true)
+      elseif cmd == "settarget" then
+        local id = tonumber(rest)
+        if id then
+          printerTarget = id
+          saveTarget(id)
+          print("Print target set to computer #" .. id)
+        else
+          print("Usage: settarget <computerID>")
+        end
+      elseif cmd == "status" then
+        cmdStatus()
+      elseif cmd == "recent" then
+        cmdRecent(rest)
+      elseif cmd == "debug" then
+        cmdDebug()
+      elseif cmd == "clear" then
+        term.clear()
+        term.setCursorPos(1, 1)
+      elseif cmd == "help" or cmd == "" then
+        cmdHelp()
+      elseif cmd == "exit" then
+        running = false
+        print("Shutting down logger.")
+      else
+        print("Unknown command. Type 'help' for a list.")
+      end
+    end
+  end
+end
+
+flushTimerID = os.startTimer(FLUSH_INTERVAL)
+
+local function eventListenerWithDebug()
+  while true do
+    local event = { os.pullEvent() }
+    local name = event[1]
+
+    if debugNext and (name == "chat" or name == "playerJoin" or name == "playerLeave") then
+      debugNext = false
+      print("[debug] raw event: " .. textutils.serialize(event))
+    end
+
+    if name == "chat" then
+      local username, message = event[2], event[3]
+      recordLine(("Chat: %s: %s"):format(tostring(username), tostring(message)))
+
+    elseif name == "playerJoin" then
+      recordLine(("Join: %s"):format(tostring(event[2])))
+
+    elseif name == "playerLeave" then
+      recordLine(("Leave: %s"):format(tostring(event[2])))
+
+    elseif name == "timer" and event[2] == flushTimerID then
+      flush(false)
+      flushTimerID = os.startTimer(FLUSH_INTERVAL)
+    end
+  end
+end
+
+parallel.waitForAny(commandLoop, eventListenerWithDebug)
