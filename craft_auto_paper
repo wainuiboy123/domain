@@ -26,6 +26,16 @@
      look toward the turtle - the "Facing:" line tells you the direction.
      (If CHEST_SIDE is "top" or "bottom" this is worked out for you.)
   4. Keep a healthy stock of minecraft:string in the chest.
+
+  ------------------------------------------------------------
+  NOTE ON TITLE READING
+  ------------------------------------------------------------
+  External inventory peripherals (like the chest) don't decode
+  ComputerCraft-specific item data (a printed page's "title" field) when
+  you call chest.getItemDetail(slot, true) - you just get a generic
+  Minecraft item description plus a raw NBT hash. Only the turtle's OWN
+  inventory decodes that field. So to read a page's title, we briefly
+  pull it into the turtle, read it there, then put it straight back.
 ]]--
 
 ------------------------------------------------------------
@@ -67,6 +77,7 @@ end
 ------------------------------------------------------------
 local GRID_SLOTS = { 1, 2, 3, 5, 6, 7, 9, 10, 11 }
 local HOLD_SLOT = 16 -- parking spot for an in-progress combined document
+local SCRATCH_SLOT = 15 -- transient slot used only to read a page's title
 local MAX_PAGES_PER_CRAFT = #GRID_SLOTS - 1 -- one grid slot always holds string
 
 ------------------------------------------------------------
@@ -87,6 +98,25 @@ local function parseTitle(title)
 end
 
 ------------------------------------------------------------
+-- Read a page's title by briefly borrowing it into the turtle, then
+-- putting it straight back into the same chest slot. See the note near
+-- the top of this file for why this round-trip is necessary.
+------------------------------------------------------------
+local function readPageTitle(chest, chestSlot)
+  if chest.pushItems(PUSH_DIRECTION, chestSlot, 1, SCRATCH_SLOT) == 0 then
+    return nil -- couldn't pull it (shouldn't normally happen)
+  end
+
+  local detail = turtle.getItemDetail(SCRATCH_SLOT, true)
+  local title = detail and detail.title
+
+  -- put it right back where it came from
+  chest.pullItems(PUSH_DIRECTION, SCRATCH_SLOT, 1, chestSlot)
+
+  return title
+end
+
+------------------------------------------------------------
 -- CHEST SCAN: group loose pages by base document number
 ------------------------------------------------------------
 local function scanChest(chest)
@@ -95,8 +125,7 @@ local function scanChest(chest)
 
   for slot, item in pairs(items) do
     if item.name == PAGE_ITEM then
-      local detail = chest.getItemDetail(slot, true)
-      local title = detail and detail.displayName
+      local title = readPageTitle(chest, slot)
       local base, sub = parseTitle(title)
       if base then
         groups[base] = groups[base] or {}
