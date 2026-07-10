@@ -1,93 +1,67 @@
--- PERIPHERAL NAME FINDER (for modded / double chests)
--- Run this directly on the turtle.
+-- ITEM DETAIL DUMPER
+-- Run this on the turtle. It finds a printed page in the chest, pulls
+-- one into the turtle temporarily, and prints EVERY field CC:Tweaked
+-- returns for it (detailed = true), so we can see what the title field
+-- is actually called.
 
-print("Peripherals visible to this turtle:")
-print("")
+local CHEST_SIDE = "left"
+local PUSH_DIRECTION = "up"  -- <<< set this to whatever worked for you
+local PAGE_ITEM = "computercraft:printed_page"
 
-local names = peripheral.getNames()
-if #names == 0 then
-  print("No peripherals found at all - is the turtle an ADVANCED/CRAFTY turtle")
-  print("with peripheral access, and is anything actually touching it?")
+local chest = peripheral.wrap(CHEST_SIDE)
+if not chest then
+  print("No chest found on side: " .. CHEST_SIDE)
   return
 end
 
-for _, name in ipairs(names) do
-  local ptype = peripheral.getType(name)
-  print(name .. "   (type: " .. tostring(ptype) .. ")")
-end
-
-print("")
-print("Look for an inventory-type entry above (chest/barrel/etc).")
-print("If its name is a plain compass word (north/south/east/west/up/down),")
-print("that word IS your PUSH_DIRECTION.")
-print("")
-print("If instead it's something like 'ironchest:diamond_chest_0' or similar")
-print("modded name, THAT full string is what needs to go in PUSH_DIRECTION -")
-print("compass words won't work for it.")
-print("")
-print("Now testing a real transfer with each name found above...")
-print("")
-
-local items = nil
-local sourceName = nil
-for _, name in ipairs(names) do
-  local ptype = peripheral.getType(name)
-  if ptype and (ptype:find("chest") or ptype:find("barrel") or ptype:find("inventory")) then
-    local p = peripheral.wrap(name)
-    if p and p.list then
-      local list = p.list()
-      if next(list) then
-        items = list
-        sourceName = name
-        break
-      end
-    end
-  end
-end
-
-if not sourceName then
-  print("Couldn't find a non-empty inventory peripheral to test with.")
-  print("Make sure the chest has at least one item in it, then re-run.")
-  return
-end
-
-local chest = peripheral.wrap(sourceName)
-local testSlot = next(items)
-print("Testing with peripheral '" .. sourceName .. "', slot " .. testSlot .. " (" .. items[testSlot].name .. ")")
-
-local ok, result = pcall(function()
-  return chest.pushItems(sourceName, testSlot, 1, 15) -- wrong direction test skipped; see below
-end)
-
--- The real test: try pushing FROM the chest TO the turtle using every
--- name we found as the "toName" (the turtle itself might show up in
--- this list if it's peripheral-accessible, or we fall back to compass).
-local candidates = {}
-for _, n in ipairs(names) do table.insert(candidates, n) end
-for _, d in ipairs({"north","south","east","west","up","down"}) do table.insert(candidates, d) end
-
-local found = nil
-for _, candidate in ipairs(candidates) do
-  local ok2, result2 = pcall(function()
-    return chest.pushItems(candidate, testSlot, 1, 15)
-  end)
-  if ok2 and result2 and result2 > 0 then
-    print(candidate .. "  ->  SUCCESS")
-    found = candidate
-    chest.pullItems(candidate, 15, 1, testSlot)
+local items = chest.list()
+local pageSlot = nil
+for slot, item in pairs(items) do
+  if item.name == PAGE_ITEM then
+    pageSlot = slot
     break
   end
 end
 
-print("")
-if found then
-  print("=====================================")
-  print("Use these in your real script:")
-  print('local CHEST_SIDE = "' .. sourceName .. '"   -- or keep your current wrap side if it already worked for chest.list()')
-  print('local PUSH_DIRECTION = "' .. found .. '"')
-  print("=====================================")
-else
-  print("Still nothing worked. Paste me the full list of peripheral names")
-  print("printed above and I'll take a closer look - this is a good sign")
-  print("the mod is using a non-standard inventory setup.")
+if not pageSlot then
+  print("No " .. PAGE_ITEM .. " found in the chest - put one in and re-run.")
+  return
 end
+
+print("Found a printed page in chest slot " .. pageSlot .. ", pulling it in to inspect...")
+
+local moved = chest.pushItems(PUSH_DIRECTION, pageSlot, 1, 15)
+if moved == 0 then
+  print("Couldn't pull it - check CHEST_SIDE/PUSH_DIRECTION at the top of this file.")
+  return
+end
+
+print("")
+print("===== turtle.getItemDetail(15, true) =====")
+local detail = turtle.getItemDetail(15, true)
+print(textutils.serialize(detail))
+
+print("")
+print("===== chest.getItemDetail(pageSlot, true) [for comparison] =====")
+-- put it back first isn't needed for this call, chest slot may now be empty
+-- so we compare using the turtle-held copy's chest-side view isn't possible;
+-- this just shows what the external peripheral sees for OTHER pages if any remain
+local remaining = chest.list()
+local otherSlot = nil
+for slot, item in pairs(remaining) do
+  if item.name == PAGE_ITEM then
+    otherSlot = slot
+    break
+  end
+end
+if otherSlot then
+  local chestDetail = chest.getItemDetail(otherSlot, true)
+  print(textutils.serialize(chestDetail))
+else
+  print("(no other page left in chest to compare against - that's fine, ignore this section)")
+end
+
+-- put the borrowed page back
+chest.pullItems(PUSH_DIRECTION, 15, 1, pageSlot)
+print("")
+print("Page returned to the chest.")
