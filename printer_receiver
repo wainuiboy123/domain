@@ -1,0 +1,437 @@
+--[[
+  ADVANCED PRINT TERMINAL
+  CC: Tweaked (Advanced Computer + Ender Modem + Printer)
+  NeoForge 1.21.1
+
+  Put this file on an Advanced Computer that has:
+    - an "ender_modem" attached (any side, wired or the block itself)
+    - a "printer" attached (wired directly or via wired network)
+
+  Save it as "startup.lua" if you want it to run automatically on boot,
+  or run it manually with:  print_terminal
+
+  CONFIDENTIALITY NOTE:
+  The only thing ever written to disk is metadata (title, sender, time,
+  document number, page count) inside the history log. The actual body
+  text of anything printed only ever exists in memory for as long as it
+  takes to lay it out on the page, and every local variable holding that
+  text is explicitly cleared immediately after printing. Nothing is
+  echoed back over rednet and nothing is retransmitted. This is a
+  best-effort protection (Lua doesn't offer secure memory wiping) but it
+  means a player reading this computer's files, or intercepting normal
+  computer use, cannot recover what was printed - only that something
+  was printed, when, how many pages, and who sent it.
+]]--
+
+------------------------------------------------------------
+-- CONFIGURATION
+------------------------------------------------------------
+local HISTORY_FILE   = ".printer_history"
+local DOCNUM_FILE    = ".docnum"
+local MAX_HISTORY_SHOWN = 20
+local PROTOCOL       = "advcomp_print"   -- rednet protocol other computers must use
+local MAX_REMOTE_LEN = 50000             -- char cap per incoming job, protects ink/paper from spam
+local NZ_OFFSET_SECONDS = 12 * 3600      -- NZST = UTC+12. Bump to 13*3600 during NZDT (Sep-Apr) if needed
+
+------------------------------------------------------------
+-- PERIPHERAL SETUP
+------------------------------------------------------------
+local printer = peripheral.find("printer")
+local modem = peripheral.find("modem", function(name, p)
+  return p.isWireless and p.isWireless()
+end)
+
+if not printer then
+  printError("[!] No printer found. Attach a printer and restart.")
+end
+if not modem then
+  printError("[!] No ender modem found. Attach an ender_modem and restart.")
+else
+  rednet.open(peripheral.getName(modem))
+end
+
+------------------------------------------------------------
+-- DOCUMENT NUMBER (d.0001 -> d.9999, wraps back to d.0001)
+------------------------------------------------------------
+local function loadDocNum()
+  if fs.exists(DOCNUM_FILE) then
+    local f = fs.open(DOCNUM_FILE, "r")
+    local n = tonumber(f.readAll())
+    f.close()
+    if n then return n end
+  end
+  return 1
+end
+
+local function saveDocNum(n)
+  local f = fs.open(DOCNUM_FILE, "w")
+  f.write(tostring(n))
+  f.close()
+end
+
+local docNum = loadDocNum()
+
+local function nextDocNum()
+  local label = string.format("d.%04d", docNum)
+  docNum = docNum + 1
+  if docNum > 9999 then docNum = 1 end
+  saveDocNum(docNum)
+  return label
+end
+
+------------------------------------------------------------
+-- TIME (NZST)
+------------------------------------------------------------
+local function nzTime()
+  local utcSeconds = math.floor(os.epoch("utc") / 1000)
+  local nzSeconds = utcSeconds + NZ_OFFSET_SECONDS
+  local timeStr = os.date("!%H:%M:%S", nzSeconds) -- full time
+  local dateStr = os.date("!%d/%m/%y", nzSeconds) -- short date
+  return timeStr, dateStr
+end
+
+------------------------------------------------------------
+-- HISTORY LOG (metadata only - content is never written here)
+------------------------------------------------------------
+local function logHistory(entry)
+  local f = fs.open(HISTORY_FILE, "a")
+  f.write(entry .. "\n")
+  f.close()
+end
+
+local function showHistory()
+  if not fs.exists(HISTORY_FILE) then
+    print("No print history yet.")
+    return
+  end
+  local f = fs.open(HISTORY_FILE, "r")
+  local raw = f.readAll()
+  f.close()
+
+  local lines = {}
+  for line in raw:gmatch("[^\n]+") do
+    table.insert(lines, line)
+  end
+
+  if #lines == 0 then
+    print("No print history yet.")
+    return
+  end
+
+  local startIdx = math.max(1, #lines - MAX_HISTORY_SHOWN + 1)
+  print(("=== Print History (last %d) ==="):format(#lines - startIdx + 1))
+  for i = startIdx, #lines do
+    print(lines[i])
+  end
+end
+
+------------------------------------------------------------
+-- TEXT WRAPPING (word-wrap to a fixed width, keeps blank lines)
+------------------------------------------------------------
+local function wrapText(text, width)
+  local lines = {}
+  for rawLine in (text .. "\n"):gmatch("(.-)\n") do
+    if rawLine == "" then
+      table.insert(lines, "")
+    else
+      local buf = ""
+      for word in rawLine:gmatch("%S+") do
+        while #word > width do
+          -- word itself longer than the page width, hard split it
+          if #buf > 0 then
+            table.insert(lines, buf)
+            buf = ""
+          end
+          table.insert(lines, word:sub(1, width))
+          word = word:sub(width + 1)
+        end
+        if #buf == 0 then
+          buf = word
+        elseif #buf + 1 + #word <= width then
+          buf = buf .. " " .. word
+        else
+          table.insert(lines, buf)
+          buf = word
+        end
+      end
+      table.insert(lines, buf)
+    end
+  end
+  return lines
+end
+
+------------------------------------------------------------
+-- PAGE SIZE (falls back to the standard 25x21 if unavailable)
+------------------------------------------------------------
+local function getPageDims()
+  local ok, w, h = pcall(function() return printer.getPageSize() end)
+  if ok and w and h then return w, h end
+  return 25, 21
+end
+
+------------------------------------------------------------
+-- CORE PRINT FUNCTION
+-- Header layout (top to bottom): Title / Sender Name / Sender ID /
+-- Time+Date (NZST) / Document Number / dashes / content.
+-- Overflow pages only carry the document number + dashes, per spec.
+------------------------------------------------------------
+local function printDocument(title, senderName, senderID, content)
+  if not printer then
+    print("Error: no printer attached.")
+    return false
+  end
+
+  local pageW, pageH = getPageDims()
+  local timeStr, dateStr = nzTime()
+  local docLabel = nextDocNum()
+
+  local header1 = {
+    title,
+    "Sender Name: " .. tostring(senderName),
+    "Sender ID: " .. tostring(senderID),
+    timeStr .. "  " .. dateStr .. " NZST",
+    docLabel,
+    string.rep("-", pageW),
+  }
+
+  local header2 = {
+    docLabel,
+    string.rep("-", pageW),
+  }
+
+  local bodyLines = wrapText(content, pageW)
+
+  local pages = {}
+  local idx = 1
+  local firstSpace = math.max(0, pageH - #header1)
+  local otherSpace = math.max(1, pageH - #header2)
+
+  local firstChunk = {}
+  while idx <= #bodyLines and #firstChunk < firstSpace do
+    table.insert(firstChunk, bodyLines[idx])
+    idx = idx + 1
+  end
+  table.insert(pages, { header = header1, body = firstChunk })
+
+  while idx <= #bodyLines do
+    local chunk = {}
+    while idx <= #bodyLines and #chunk < otherSpace do
+      table.insert(chunk, bodyLines[idx])
+      idx = idx + 1
+    end
+    table.insert(pages, { header = header2, body = chunk })
+  end
+
+  for pNum, page in ipairs(pages) do
+    if not printer.newPage() then
+      print(("Error: printer out of paper/ink (stopped on page %d)."):format(pNum))
+      -- still log what we managed, then scrub and bail
+      logHistory(("%s | %s %s NZST | %s | Sender: %s (%s) | pages: %d (INCOMPLETE - out of paper/ink)")
+        :format(docLabel, timeStr, dateStr, title, senderName, tostring(senderID), pNum - 1))
+      content, bodyLines, pages = nil, nil, nil
+      return false
+    end
+
+    printer.setPageTitle(pNum == 1 and docLabel or (docLabel .. "-" .. pNum))
+
+    local y = 1
+    for _, line in ipairs(page.header) do
+      printer.setCursorPos(1, y)
+      printer.write(line)
+      y = y + 1
+    end
+    for _, line in ipairs(page.body) do
+      printer.setCursorPos(1, y)
+      printer.write(line)
+      y = y + 1
+    end
+
+    printer.endPage()
+  end
+
+  -- METADATA ONLY log entry - the body text is never written to disk
+  logHistory(("%s | %s %s NZST | %s | Sender: %s (%s) | pages: %d")
+    :format(docLabel, timeStr, dateStr, title, senderName, tostring(senderID), #pages))
+
+  -- best-effort scrub: drop every reference to the printed text
+  content, bodyLines, pages = nil, nil, nil
+
+  return true
+end
+
+------------------------------------------------------------
+-- COMMAND: PRINT <url>
+------------------------------------------------------------
+local function cmdPrintURL(url)
+  if not url or url == "" then
+    print("Usage: print <raw file url>")
+    return
+  end
+
+  print("Fetching " .. url .. " ...")
+  local ok, response = pcall(http.get, url)
+  if not ok or not response then
+    print("Failed to fetch that URL. Check the link and that HTTP is enabled.")
+    return
+  end
+
+  local body = response.readAll()
+  response.close()
+
+  if not body or body == "" then
+    print("Fetched page was empty, nothing printed.")
+    return
+  end
+
+  local host = url:match("^https?://([^/]+)") or url
+  local ok2 = printDocument("Manual Print Log", host, "HTTP Fetch (local)", body)
+  body = nil -- scrub
+
+  if ok2 then print("Printed successfully.") end
+end
+
+------------------------------------------------------------
+-- COMMAND: WRITE / COMPOSE (type a document directly on this computer)
+------------------------------------------------------------
+local function cmdCompose()
+  print("Compose mode - type your document below.")
+  print("Enter '.' alone on a line to print it, or ':cancel' to abort.")
+
+  local lines = {}
+  while true do
+    write("> ")
+    local line = read()
+    if line == "." then
+      break
+    elseif line == ":cancel" then
+      print("Cancelled, nothing kept.")
+      return
+    else
+      table.insert(lines, line)
+    end
+  end
+
+  local content = table.concat(lines, "\n")
+  lines = nil
+
+  if content == "" then
+    print("Empty document, not printing.")
+    return
+  end
+
+  write(("Print this document now? (%d lines) [y/n]: "):format(select(2, content:gsub("\n", "\n")) + 1))
+  local confirm = read()
+  if not confirm or confirm:lower() ~= "y" then
+    print("Discarded.")
+    content = nil
+    return
+  end
+
+  local selfName = os.getComputerLabel() or ("Computer #" .. os.getComputerID())
+  local ok = printDocument("Composed Document", selfName, "Local (" .. os.getComputerID() .. ")", content)
+  content = nil
+
+  if ok then print("Document printed.") end
+end
+
+------------------------------------------------------------
+-- REDNET LISTENER: incoming print jobs -> "Automatic Print Log"
+-- Anyone may send a job (per spec, printing itself stays open to all),
+-- but only sender id/name + timing is ever retained afterwards.
+------------------------------------------------------------
+local function rednetListener()
+  if not modem then return end
+  while true do
+    local senderID, message = rednet.receive(PROTOCOL)
+
+    if type(message) == "table" and type(message.content) == "string" then
+      local senderName = type(message.name) == "string" and message.name or "Unknown"
+      local content = message.content
+      message = nil
+
+      if #content > MAX_REMOTE_LEN then
+        content = content:sub(1, MAX_REMOTE_LEN) .. "\n[TRUNCATED - exceeded size limit]"
+      end
+
+      printDocument("Automatic Print Log", senderName, tostring(senderID), content)
+      content = nil -- scrub
+    end
+  end
+end
+
+------------------------------------------------------------
+-- HELP / STATUS
+------------------------------------------------------------
+local function cmdHelp()
+  print("Available commands:")
+  print("  print <url>   fetch a raw text URL and print it")
+  print("  write         compose and print a document on this terminal")
+  print("  history       show recent print history (metadata only)")
+  print("  status        show peripheral + system status")
+  print("  clear         clear this terminal's screen")
+  print("  help          show this help")
+  print("  exit          stop the program (also stops the listener)")
+  print("")
+  print("Remote computers print here by sending, over rednet on")
+  print("protocol '" .. PROTOCOL .. "', a table: {name=\"Their Name\", content=\"text\"}")
+end
+
+local function cmdStatus()
+  print("=== Status ===")
+  print("Printer:      " .. (printer and "connected" or "MISSING"))
+  print("Ender Modem:  " .. (modem and "connected, listening" or "MISSING"))
+  print("Computer ID:  " .. os.getComputerID())
+  print("Label:        " .. (os.getComputerLabel() or "(none)"))
+  print("Next doc #:   " .. string.format("d.%04d", docNum))
+  local t, d = nzTime()
+  print("NZ time now:  " .. t .. "  " .. d)
+  if printer then
+    local okI, ink = pcall(printer.getInkLevel)
+    local okP, paper = pcall(printer.getPaperLevel)
+    if okI then print("Ink level:    " .. tostring(ink)) end
+    if okP then print("Paper level:  " .. tostring(paper)) end
+  end
+end
+
+------------------------------------------------------------
+-- MAIN COMMAND LOOP
+------------------------------------------------------------
+local running = true
+
+local function commandLoop()
+  print("Advanced Print Terminal ready. Type 'help' for commands.")
+  while running do
+    write("printer> ")
+    local input = read()
+    if input then
+      local cmd, rest = input:match("^(%S*)%s*(.-)$")
+      cmd = (cmd or ""):lower()
+
+      if cmd == "print" then
+        cmdPrintURL(rest)
+      elseif cmd == "write" or cmd == "compose" then
+        cmdCompose()
+      elseif cmd == "history" then
+        showHistory()
+      elseif cmd == "status" then
+        cmdStatus()
+      elseif cmd == "clear" then
+        term.clear()
+        term.setCursorPos(1, 1)
+      elseif cmd == "help" or cmd == "" then
+        cmdHelp()
+      elseif cmd == "exit" then
+        running = false
+        print("Shutting down terminal.")
+      else
+        print("Unknown command. Type 'help' for a list.")
+      end
+    end
+  end
+end
+
+if modem then
+  parallel.waitForAny(commandLoop, rednetListener)
+else
+  commandLoop()
+end
