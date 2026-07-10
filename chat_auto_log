@@ -4,7 +4,7 @@
 local LOG_FILE       = "activity_log.txt"  
 local TARGET_FILE    = ".print_target"
 local PROTOCOL       = "advcomp_print"      
-local FLUSH_INTERVAL = 300                  
+local FLUSH_INTERVAL = 3600                  
 local LOGGER_NAME    = "Server Activity Logger" 
 local NZ_OFFSET_SECONDS = 12 * 3600     
 
