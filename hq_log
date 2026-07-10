@@ -1,0 +1,417 @@
+--[[
+  HQ SCRIPT
+  CC: Tweaked - NeoForge 1.21.1
+
+  Runs on the headquarters computer. Requires:
+    - an ender_modem
+    - a monitor, 1 block tall x 3 blocks wide
+
+  No printer needed on this computer - typing 'print' hands the log off
+  to a separate print_terminal.lua computer over rednet (same way
+  activity_logger.lua does it), so it comes out the physical printer
+  attached to THAT computer.
+
+  Listens for encrypted broadcasts from every cannon_unit.lua computer,
+  decrypts them, and keeps a live sleek list on the monitor:
+    Cannon Name (white) | Operator (white) | READY/NOT READY (green/red)
+    | OPEN/CLOSED (green/red)
+
+  Every change is timestamped (NZST) and logged permanently to disk.
+  Typing 'print' sends everything logged since the last print to the
+  print terminal as one document.
+
+  First time setup: run "settarget <computerID>" once, using the ID of
+  the computer running print_terminal.lua. Saved to disk after that.
+
+  *** SHARED_KEY below must be identical on this script and cannon_unit.lua ***
+]]--
+
+------------------------------------------------------------
+-- CONFIGURATION
+------------------------------------------------------------
+local PROTOCOL          = "hq_cannon_net"
+local SHARED_KEY        = "CHANGE-THIS-SHARED-KEY-32chars!" -- must match cannon units
+local LOG_FILE           = "cannon_network_log.txt"          -- permanent record, never erased
+local OFFLINE_TIMEOUT_MS = 45 * 1000  -- mark a cannon OFFLINE if quiet this long
+local REDRAW_INTERVAL    = 2          -- seconds between monitor refreshes
+local NZ_OFFSET_SECONDS  = 12 * 3600  -- NZST = UTC+12, use 13*3600 during NZDT (Sep-Apr)
+
+-- remote print terminal (print_terminal.lua) hookup
+local PRINT_PROTOCOL = "advcomp_print"  -- must match print_terminal.lua
+local PRINT_TARGET_FILE = ".hq_print_target"
+local LOGGER_NAME = "HQ System" -- shown as "Sender Name:" on the printed page
+
+------------------------------------------------------------
+-- LIGHTWEIGHT XOR ENCRYPTION (matches cannon_unit.lua)
+------------------------------------------------------------
+local function byteXor(a, b)
+  local result, bitVal = 0, 1
+  while a > 0 or b > 0 do
+    local abit, bbit = a % 2, b % 2
+    if abit ~= bbit then result = result + bitVal end
+    a = (a - abit) / 2
+    b = (b - bbit) / 2
+    bitVal = bitVal * 2
+  end
+  return result
+end
+
+local function xorString(data, key)
+  local out = {}
+  local keyLen = #key
+  for i = 1, #data do
+    out[i] = string.char(byteXor(data:byte(i), key:byte(((i - 1) % keyLen) + 1)))
+  end
+  return table.concat(out)
+end
+
+local function toHex(str)
+  return (str:gsub(".", function(c) return string.format("%02x", c:byte()) end))
+end
+
+local function fromHex(str)
+  return (str:gsub("%x%x", function(cc) return string.char(tonumber(cc, 16)) end))
+end
+
+local function decrypt(ciphertext)
+  return xorString(fromHex(ciphertext), SHARED_KEY)
+end
+
+------------------------------------------------------------
+-- PERIPHERAL SETUP
+------------------------------------------------------------
+local modem = peripheral.find("modem", function(_, p) return p.isWireless and p.isWireless() end)
+local monitor = peripheral.find("monitor")
+
+if not modem then printError("[!] No ender modem found.") else rednet.open(peripheral.getName(modem)) end
+if not monitor then printError("[!] No monitor found.") end
+
+------------------------------------------------------------
+-- TIME (NZST)
+------------------------------------------------------------
+local function nzTime()
+  local utcSeconds = math.floor(os.epoch("utc") / 1000)
+  local nzSeconds = utcSeconds + NZ_OFFSET_SECONDS
+  return os.date("!%H:%M:%S", nzSeconds), os.date("!%d/%m/%y", nzSeconds)
+end
+
+------------------------------------------------------------
+-- PRINT TARGET (which computer runs print_terminal.lua)
+------------------------------------------------------------
+local function loadPrintTarget()
+  if fs.exists(PRINT_TARGET_FILE) then
+    local f = fs.open(PRINT_TARGET_FILE, "r")
+    local id = tonumber(f.readAll())
+    f.close()
+    return id
+  end
+  return nil
+end
+
+local function savePrintTarget(id)
+  local f = fs.open(PRINT_TARGET_FILE, "w")
+  f.write(tostring(id))
+  f.close()
+end
+
+local printTarget = loadPrintTarget()
+
+------------------------------------------------------------
+-- STATE
+------------------------------------------------------------
+local cannons = {}    -- [senderID] = { name=, user=, shell=, ready=, hatch=, lastSeen= }
+local pendingLog = {}  -- lines not yet printed
+local needsRedraw = true
+
+------------------------------------------------------------
+-- LOGGING
+------------------------------------------------------------
+local function logEvent(text)
+  local t, d = nzTime()
+  local full = ("[%s %s NZST] %s"):format(t, d, text)
+
+  local f = fs.open(LOG_FILE, "a")
+  f.write(full .. "\n")
+  f.close()
+
+  table.insert(pendingLog, full)
+  print(full)
+end
+
+------------------------------------------------------------
+-- MESSAGE HANDLING
+------------------------------------------------------------
+local function handleMessage(id, data)
+  local c = cannons[id]
+
+  if data.t == "register" then
+    local isNew = (c == nil)
+    cannons[id] = {
+      name = data.name, user = data.user, shell = data.shell,
+      ready = c and c.ready or false,
+      hatch = c and c.hatch or false,
+      lastSeen = os.epoch("utc"),
+    }
+    logEvent(("%s cannon '%s' (operator %s, shell: %s) [id %d]")
+      :format(isNew and "Registered" or "Re-registered", data.name, data.user, data.shell, id))
+
+  elseif data.t == "status" then
+    if not c then
+      cannons[id] = { name = "Unknown-" .. id, user = "?", shell = "?", ready = false, hatch = false, lastSeen = os.epoch("utc") }
+      c = cannons[id]
+    end
+    local changes = {}
+    if data.ready ~= nil and data.ready ~= c.ready then
+      table.insert(changes, data.ready and "now READY" or "now NOT READY")
+      c.ready = data.ready
+    end
+    if data.hatch ~= nil and data.hatch ~= c.hatch then
+      table.insert(changes, data.hatch and "hatch OPEN" or "hatch CLOSED")
+      c.hatch = data.hatch
+    end
+    c.lastSeen = os.epoch("utc")
+    if #changes > 0 then
+      logEvent(("%s (%s): %s"):format(c.name, c.user, table.concat(changes, ", ")))
+    end
+  end
+
+  needsRedraw = true
+end
+
+local function listener()
+  if not modem then return end
+  while true do
+    local id, encrypted = rednet.receive(PROTOCOL)
+    if type(encrypted) == "string" then
+      local ok, serialized = pcall(decrypt, encrypted)
+      if ok then
+        local ok2, data = pcall(textutils.unserialize, serialized)
+        if ok2 and type(data) == "table" then
+          handleMessage(id, data)
+        end
+      end
+    end
+  end
+end
+
+------------------------------------------------------------
+-- MONITOR DISPLAY
+------------------------------------------------------------
+local function fitField(text, width)
+  text = tostring(text or "")
+  if #text > width then
+    return text:sub(1, math.max(1, width - 1)) .. (width > 1 and "." or "")
+  end
+  return text .. string.rep(" ", width - #text)
+end
+
+local function drawMonitor()
+  if not monitor then return end
+  monitor.setTextScale(0.5)
+  local w, h = monitor.getSize()
+
+  monitor.setBackgroundColor(colors.black)
+  monitor.clear()
+
+  -- header
+  monitor.setCursorPos(1, 1)
+  monitor.setBackgroundColor(colors.gray)
+  monitor.setTextColor(colors.white)
+  monitor.clearLine()
+  local header = "CANNON NETWORK"
+  monitor.setCursorPos(math.max(1, math.floor((w - #header) / 2) + 1), 1)
+  monitor.write(header)
+  monitor.setBackgroundColor(colors.black)
+
+  -- column widths: name | operator | ready | hatch
+  local nameW = math.max(4, math.floor(w * 0.34))
+  local userW = math.max(4, math.floor(w * 0.24))
+  local readyW = math.max(4, math.floor(w * 0.20))
+  local hatchW = math.max(4, w - nameW - userW - readyW)
+
+  local list = {}
+  for id, c in pairs(cannons) do table.insert(list, { id = id, c = c }) end
+  table.sort(list, function(a, b) return a.c.name < b.c.name end)
+
+  local row = 2
+  for _, entry in ipairs(list) do
+    if row > h then break end
+    local c = entry.c
+    local offline = (os.epoch("utc") - c.lastSeen) > OFFLINE_TIMEOUT_MS
+
+    local col = 1
+    monitor.setCursorPos(col, row)
+    monitor.setTextColor(colors.white)
+    monitor.write(fitField(c.name, nameW))
+    col = col + nameW
+
+    monitor.setCursorPos(col, row)
+    monitor.setTextColor(colors.white)
+    monitor.write(fitField(c.user, userW))
+    col = col + userW
+
+    monitor.setCursorPos(col, row)
+    if offline then
+      monitor.setTextColor(colors.gray)
+      monitor.write(fitField("OFFLINE", readyW))
+    else
+      monitor.setTextColor(c.ready and colors.green or colors.red)
+      monitor.write(fitField(c.ready and "READY" or "NOT RDY", readyW))
+    end
+    col = col + readyW
+
+    monitor.setCursorPos(col, row)
+    if not offline then
+      monitor.setTextColor(c.hatch and colors.green or colors.red)
+      monitor.write(fitField(c.hatch and "OPEN" or "CLOSED", hatchW))
+    end
+
+    row = row + 1
+  end
+
+  monitor.setTextColor(colors.white)
+  monitor.setBackgroundColor(colors.black)
+end
+
+local function redrawLoop()
+  while true do
+    if needsRedraw then
+      drawMonitor()
+      needsRedraw = false
+    end
+    sleep(REDRAW_INTERVAL)
+    needsRedraw = true -- also periodically refresh to update OFFLINE status
+  end
+end
+
+------------------------------------------------------------
+-- TEXT WRAPPING + PRINTING (same style as the print terminal system)
+------------------------------------------------------------
+local function wrapText(text, width)
+  local lines = {}
+  for rawLine in (text .. "\n"):gmatch("(.-)\n") do
+    if rawLine == "" then
+      table.insert(lines, "")
+    else
+      local buf = ""
+      for word in rawLine:gmatch("%S+") do
+        if #buf == 0 then
+          buf = word
+        elseif #buf + 1 + #word <= width then
+          buf = buf .. " " .. word
+        else
+          table.insert(lines, buf)
+          buf = word
+        end
+      end
+      table.insert(lines, buf)
+    end
+  end
+  return lines
+end
+
+local function getPageDims()
+  local ok, w, h = pcall(function() return printer.getPageSize() end)
+  if ok and w and h then return w, h end
+  return 25, 21
+end
+
+local function printLog()
+  if not printer then
+    print("No printer attached.")
+    return
+  end
+  if #pendingLog == 0 then
+    print("Nothing new to print.")
+    return
+  end
+
+  local content = table.concat(pendingLog, "\n")
+  local pageW, pageH = getPageDims()
+  local timeStr, dateStr = nzTime()
+  local docLabel = nextDocNum()
+
+  local header1 = {
+    "Cannon Network Log",
+    "Sender Name: HQ System",
+    "Sender ID: " .. os.getComputerID(),
+    timeStr .. "  " .. dateStr .. " NZST",
+    docLabel,
+    string.rep("-", pageW),
+  }
+  local header2 = { docLabel, string.rep("-", pageW) }
+
+  local bodyLines = wrapText(content, pageW)
+  local pages = {}
+  local idx = 1
+  local firstSpace = math.max(0, pageH - #header1)
+  local otherSpace = math.max(1, pageH - #header2)
+
+  local firstChunk = {}
+  while idx <= #bodyLines and #firstChunk < firstSpace do
+    table.insert(firstChunk, bodyLines[idx]); idx = idx + 1
+  end
+  table.insert(pages, { header = header1, body = firstChunk })
+
+  while idx <= #bodyLines do
+    local chunk = {}
+    while idx <= #bodyLines and #chunk < otherSpace do
+      table.insert(chunk, bodyLines[idx]); idx = idx + 1
+    end
+    table.insert(pages, { header = header2, body = chunk })
+  end
+
+  for pNum, page in ipairs(pages) do
+    if not printer.newPage() then
+      print("Printer out of paper/ink, stopped partway.")
+      break
+    end
+    printer.setPageTitle(pNum == 1 and docLabel or (docLabel .. "-" .. pNum))
+    local y = 1
+    for _, line in ipairs(page.header) do
+      printer.setCursorPos(1, y); printer.write(line); y = y + 1
+    end
+    for _, line in ipairs(page.body) do
+      printer.setCursorPos(1, y); printer.write(line); y = y + 1
+    end
+    printer.endPage()
+  end
+
+  print(("Printed %s (%d page%s)."):format(docLabel, #pages, #pages == 1 and "" or "s"))
+  pendingLog = {}
+  content = nil
+end
+
+------------------------------------------------------------
+-- COMMAND LOOP
+------------------------------------------------------------
+local function commandLoop()
+  print("HQ ready. Type 'print', 'status', 'help', or 'exit'.")
+  while true do
+    write("hq> ")
+    local input = read()
+    if input == "print" then
+      printLog()
+    elseif input == "status" then
+      local count = 0
+      for _ in pairs(cannons) do count = count + 1 end
+      print("Tracking " .. count .. " cannon(s). " .. #pendingLog .. " log line(s) pending print.")
+    elseif input == "help" then
+      print("print   - send everything logged since the last print to the printer")
+      print("status  - show cannon count and pending log size")
+      print("exit    - stop the command loop (monitor/listener keep running)")
+    elseif input == "exit" then
+      print("Command loop stopped.")
+      return
+    elseif input ~= nil and input ~= "" then
+      print("Unknown command.")
+    end
+  end
+end
+
+------------------------------------------------------------
+-- MAIN
+------------------------------------------------------------
+if monitor then drawMonitor() end
+
+parallel.waitForAny(listener, redrawLoop, commandLoop)
