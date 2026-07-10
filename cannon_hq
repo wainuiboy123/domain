@@ -1,0 +1,237 @@
+--[[
+  CANNON UNIT SCRIPT
+  CC: Tweaked - NeoForge 1.21.1
+
+  Runs on each individual cannon's computer. Requires:
+    - an ender_modem
+    - a 1x1 monitor
+    - a redstone connection on the BOTTOM of the computer (hatch control)
+
+  On first run it asks for a weapon name, a username, and a shell type,
+  saves them locally so it never has to ask again, then registers with
+  HQ over an encrypted rednet broadcast.
+
+  The monitor shows two big touch buttons:
+    - top half:    toggle READY / NOT READY
+    - bottom half: toggle hatch OPEN / CLOSED (also flips a redstone
+                    signal on the bottom of the computer)
+
+  Every state change is sent to HQ immediately, encrypted. A quiet
+  heartbeat is also sent periodically so HQ can tell if a cannon has
+  gone offline.
+
+  *** SHARED_KEY below must be identical on this script and hq_script.lua ***
+]]--
+
+------------------------------------------------------------
+-- CONFIGURATION
+------------------------------------------------------------
+local PROTOCOL      = "hq_cannon_net"
+local SHARED_KEY     = "CHANGE-THIS-SHARED-KEY-32chars!" -- must match HQ
+local ID_FILE         = ".cannon_identity"
+local HEARTBEAT_INTERVAL = 20 -- seconds
+
+------------------------------------------------------------
+-- LIGHTWEIGHT XOR ENCRYPTION (see note in the chat reply re: security)
+------------------------------------------------------------
+local function byteXor(a, b)
+  local result, bitVal = 0, 1
+  while a > 0 or b > 0 do
+    local abit, bbit = a % 2, b % 2
+    if abit ~= bbit then result = result + bitVal end
+    a = (a - abit) / 2
+    b = (b - bbit) / 2
+    bitVal = bitVal * 2
+  end
+  return result
+end
+
+local function xorString(data, key)
+  local out = {}
+  local keyLen = #key
+  for i = 1, #data do
+    out[i] = string.char(byteXor(data:byte(i), key:byte(((i - 1) % keyLen) + 1)))
+  end
+  return table.concat(out)
+end
+
+local function toHex(str)
+  return (str:gsub(".", function(c) return string.format("%02x", c:byte()) end))
+end
+
+local function fromHex(str)
+  return (str:gsub("%x%x", function(cc) return string.char(tonumber(cc, 16)) end))
+end
+
+local function encrypt(plaintext)
+  return toHex(xorString(plaintext, SHARED_KEY))
+end
+
+local function decrypt(ciphertext)
+  return xorString(fromHex(ciphertext), SHARED_KEY)
+end
+
+------------------------------------------------------------
+-- PERIPHERAL SETUP
+------------------------------------------------------------
+local modem = peripheral.find("modem", function(_, p) return p.isWireless and p.isWireless() end)
+local monitor = peripheral.find("monitor")
+
+if not modem then printError("[!] No ender modem found.") else rednet.open(peripheral.getName(modem)) end
+if not monitor then printError("[!] No monitor found.") end
+
+------------------------------------------------------------
+-- IDENTITY (asked once, then saved)
+------------------------------------------------------------
+local function loadIdentity()
+  if fs.exists(ID_FILE) then
+    local f = fs.open(ID_FILE, "r")
+    local data = textutils.unserialize(f.readAll())
+    f.close()
+    return data
+  end
+  return nil
+end
+
+local function saveIdentity(data)
+  local f = fs.open(ID_FILE, "w")
+  f.write(textutils.serialize(data))
+  f.close()
+end
+
+local identity = loadIdentity()
+if not identity then
+  term.clear()
+  term.setCursorPos(1, 1)
+  print("=== First-time cannon setup ===")
+  write("Weapon name: ")
+  local weaponName = read()
+  write("Username (operator): ")
+  local username = read()
+  write("Shell type: ")
+  local shellType = read()
+  identity = { name = weaponName, user = username, shell = shellType }
+  saveIdentity(identity)
+  print("Saved.")
+end
+
+------------------------------------------------------------
+-- STATE
+------------------------------------------------------------
+local ready = false
+local hatchOpen = false
+
+------------------------------------------------------------
+-- SENDING
+------------------------------------------------------------
+local function sendEncrypted(msgTable)
+  if not modem then return end
+  local serialized = textutils.serialize(msgTable)
+  rednet.broadcast(encrypt(serialized), PROTOCOL)
+end
+
+local function sendRegister()
+  sendEncrypted({ t = "register", name = identity.name, user = identity.user, shell = identity.shell })
+end
+
+local function sendStatus()
+  sendEncrypted({ t = "status", ready = ready, hatch = hatchOpen })
+end
+
+------------------------------------------------------------
+-- MONITOR UI
+------------------------------------------------------------
+local function drawMonitor()
+  if not monitor then return end
+  local w, h = monitor.getSize()
+  local midRow = math.floor(h / 2)
+
+  monitor.setBackgroundColor(ready and colors.green or colors.red)
+  monitor.setTextColor(colors.white)
+  for row = 1, midRow do
+    monitor.setCursorPos(1, row)
+    monitor.write(string.rep(" ", w))
+  end
+  local readyLabel = ready and "READY" or "NOT READY"
+  monitor.setCursorPos(math.max(1, math.floor((w - #readyLabel) / 2) + 1), math.max(1, math.floor(midRow / 2) + 1))
+  monitor.write(readyLabel)
+
+  monitor.setBackgroundColor(hatchOpen and colors.green or colors.red)
+  for row = midRow + 1, h do
+    monitor.setCursorPos(1, row)
+    monitor.write(string.rep(" ", w))
+  end
+  local hatchLabel = "HATCH " .. (hatchOpen and "OPEN" or "CLOSED")
+  local hatchRow = midRow + 1 + math.max(0, math.floor((h - midRow) / 2))
+  monitor.setCursorPos(math.max(1, math.floor((w - #hatchLabel) / 2) + 1), hatchRow)
+  monitor.write(hatchLabel)
+
+  monitor.setBackgroundColor(colors.black)
+end
+
+------------------------------------------------------------
+-- TOGGLES
+------------------------------------------------------------
+local function toggleReady()
+  ready = not ready
+  drawMonitor()
+  sendStatus()
+end
+
+local function toggleHatch()
+  hatchOpen = not hatchOpen
+  redstone.setOutput("bottom", hatchOpen)
+  drawMonitor()
+  sendStatus()
+end
+
+------------------------------------------------------------
+-- MAIN LOOPS
+------------------------------------------------------------
+local function touchListener()
+  if not monitor then return end
+  local w, h = monitor.getSize()
+  local midRow = math.floor(h / 2)
+  while true do
+    local _, side, x, y = os.pullEvent("monitor_touch")
+    if y <= midRow then
+      toggleReady()
+    else
+      toggleHatch()
+    end
+  end
+end
+
+local function heartbeatLoop()
+  while true do
+    sendStatus()
+    sleep(HEARTBEAT_INTERVAL)
+  end
+end
+
+local function commandLoop()
+  print("Cannon unit '" .. identity.name .. "' online. Type 'status' or 'exit'.")
+  while true do
+    write("cannon> ")
+    local input = read()
+    if input == "status" then
+      print(("Ready: %s | Hatch: %s"):format(tostring(ready), hatchOpen and "OPEN" or "CLOSED"))
+    elseif input == "exit" then
+      print("Shutting down (monitor/heartbeat keep running until reboot).")
+      return
+    end
+  end
+end
+
+if monitor then
+  monitor.setTextScale(1)
+  monitor.setBackgroundColor(colors.black)
+  monitor.clear()
+  drawMonitor()
+end
+
+redstone.setOutput("bottom", hatchOpen)
+sendRegister()
+sendStatus()
+
+parallel.waitForAny(touchListener, heartbeatLoop, commandLoop)
