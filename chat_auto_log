@@ -1,18 +1,20 @@
-
-
-
 local LOG_FILE       = "activity_log.txt"  
-local TARGET_FILE    = ".print_target"
-local PROTOCOL       = "advcomp_print"      
 local FLUSH_INTERVAL = 3600                  
 local LOGGER_NAME    = "Server Activity Logger" 
 local NZ_OFFSET_SECONDS = 12 * 3600     
 
+-- Discord webhook - every chat/join/leave posts here immediately, and
+-- 'print' posts a digest of everything pending. Anyone with this URL can
+-- post to the channel, so keep it out of anywhere public.
+local WEBHOOK_URL = "https://discord.com/api/webhooks/1525292792841113652/jBu8zuO3Zqwuj6VT2oVdf2VzTXxsYpo_zbNA2UUCSo8Mg0TWTViKDOugKG3i61xgF1EK"
+
+local COLOR_CHAT   = 0x5865F2 -- Discord blurple
+local COLOR_JOIN   = 0x57F287 -- green
+local COLOR_LEAVE  = 0xED4245 -- red
+local COLOR_DIGEST = 0xFEE75C -- gold
+
 local chatBox = peripheral.find("chat_box")
 local playerDetector = peripheral.find("player_detector")
-local modem = peripheral.find("modem", function(_, p)
-  return p.isWireless and p.isWireless()
-end)
 
 if not chatBox then
   printError("[!] No chatBox found - chat messages will not be captured.")
@@ -20,36 +22,123 @@ end
 if not playerDetector then
   printError("[!] No playerDetector found - join/leave will not be captured.")
 end
-if not modem then
-  printError("[!] No ender modem found - logs will save locally but cannot be sent.")
-else
-  rednet.open(peripheral.getName(modem))
+if not http then
+  printError("[!] HTTP API is disabled on this computer - webhook posts will fail. Ask a server admin to enable it.")
 end
-
-local function loadTarget()
-  if fs.exists(TARGET_FILE) then
-    local f = fs.open(TARGET_FILE, "r")
-    local id = tonumber(f.readAll())
-    f.close()
-    return id
-  end
-  return nil
-end
-
-local function saveTarget(id)
-  local f = fs.open(TARGET_FILE, "w")
-  f.write(tostring(id))
-  f.close()
-end
-
-local printerTarget = loadTarget()
-
-
 
 local function nzTime()
   local utcSeconds = math.floor(os.epoch("utc") / 1000)
   local nzSeconds = utcSeconds + NZ_OFFSET_SECONDS
   return os.date("!%H:%M:%S", nzSeconds), os.date("!%d/%m/%y", nzSeconds)
+end
+
+local function isoTimestamp()
+  local utcSeconds = math.floor(os.epoch("utc") / 1000)
+  return os.date("!%Y-%m-%dT%H:%M:%SZ", utcSeconds)
+end
+
+local function avatarUrl(username)
+  return "https://mc-heads.net/avatar/" .. textutils.urlEncode(username) .. "/64"
+end
+
+-- Low-level: POST an arbitrary payload table to the webhook as JSON.
+local function postWebhook(payload)
+  if not http then return false, "http API disabled" end
+
+  local ok, body = pcall(textutils.serialiseJSON, payload)
+  if not ok then return false, "failed to encode payload: " .. tostring(body) end
+
+  local response, err = http.post(WEBHOOK_URL, body, { ["Content-Type"] = "application/json" })
+  if not response then
+    return false, err or "unknown error"
+  end
+  response.close()
+  return true
+end
+
+local function postWebhookSafe(payload, context)
+  local ok, err = postWebhook(payload)
+  if not ok then
+    print(("Webhook post failed (%s): %s"):format(context or "?", tostring(err)))
+  end
+  return ok
+end
+
+-- One embed per chat message / join / leave, posted immediately.
+local function postChatEmbed(username, message)
+  postWebhookSafe({
+    username = LOGGER_NAME,
+    embeds = { {
+      author = { name = username, icon_url = avatarUrl(username) },
+      description = message,
+      color = COLOR_CHAT,
+      timestamp = isoTimestamp(),
+    } },
+  }, "chat")
+end
+
+local function postJoinEmbed(username)
+  postWebhookSafe({
+    username = LOGGER_NAME,
+    embeds = { {
+      author = { name = username, icon_url = avatarUrl(username) },
+      description = "**" .. username .. "** joined the server.",
+      color = COLOR_JOIN,
+      timestamp = isoTimestamp(),
+    } },
+  }, "join")
+end
+
+local function postLeaveEmbed(username)
+  postWebhookSafe({
+    username = LOGGER_NAME,
+    embeds = { {
+      author = { name = username, icon_url = avatarUrl(username) },
+      description = "**" .. username .. "** left the server.",
+      color = COLOR_LEAVE,
+      timestamp = isoTimestamp(),
+    } },
+  }, "leave")
+end
+
+-- Groups whole lines into chunks under maxChars (never splits a line).
+local function chunkLines(lines, maxChars)
+  local chunks, current, currentLen = {}, {}, 0
+  for _, line in ipairs(lines) do
+    local lineLen = #line + 1
+    if currentLen + lineLen > maxChars and #current > 0 then
+      table.insert(chunks, table.concat(current, "\n"))
+      current, currentLen = {}, 0
+    end
+    table.insert(current, line)
+    currentLen = currentLen + lineLen
+  end
+  if #current > 0 then table.insert(chunks, table.concat(current, "\n")) end
+  return chunks
+end
+
+-- Posts the whole pending log as one or more tidy code-block embeds.
+-- Discord caps embed descriptions at 4096 chars and 10 embeds/message,
+-- so this chunks generously under both limits and sends multiple
+-- messages if a digest is really large.
+local function postDigest(lines)
+  local chunks = chunkLines(lines, 1500)
+  local t, d = nzTime()
+  local batchSize = 5
+
+  for i = 1, #chunks, batchSize do
+    local embeds = {}
+    for j = i, math.min(i + batchSize - 1, #chunks) do
+      table.insert(embeds, {
+        title = (j == 1) and "\240\159\147\139 Activity Log Digest" or nil,
+        description = "```\n" .. chunks[j] .. "\n```",
+        color = COLOR_DIGEST,
+        footer = { text = ("%d entries - NZT %s %s"):format(#lines, t, d) },
+        timestamp = isoTimestamp(),
+      })
+    end
+    postWebhookSafe({ username = LOGGER_NAME, embeds = embeds }, "digest")
+  end
 end
 
 
@@ -79,31 +168,22 @@ local function flush(manual)
     return
   end
 
-  if not modem then
-    print("No ender modem - cannot send. (" .. #pending .. " lines still saved locally.)")
+  if not http then
+    print("HTTP API disabled - cannot send. (" .. #pending .. " lines still saved locally.)")
     return
   end
 
-  if not printerTarget then
-    print("No print target set. Use: settarget <computerID>")
-    print("(" .. #pending .. " lines still saved locally, will be sent once a target is set.)")
-    return
-  end
+  postDigest(pending)
 
-  local content = table.concat(pending, "\n")
-  rednet.send(printerTarget, { name = LOGGER_NAME, content = content }, PROTOCOL)
-
-  print(("Sent %d line(s) to computer #%d."):format(#pending, printerTarget))
+  print(("Sent %d line(s) to the webhook."):format(#pending))
   pending = {}
-  content = nil
   lastFlush = os.time()
 end
 
 
 local function cmdHelp()
   print("Available commands:")
-  print("  print              send everything pending to the print terminal now")
-  print("  settarget <id>     set which computer runs print_terminal.lua")
+  print("  print              send everything pending to the webhook now")
   print("  status             show peripheral + logger status")
   print("  recent [n]         show the last n lines of the local log (default 20)")
   print("  debug              print the raw fields of the next captured event")
@@ -116,8 +196,7 @@ local function cmdStatus()
   print("=== Status ===")
   print("Chat Box:        " .. (chatBox and "connected" or "MISSING"))
   print("Player Detector: " .. (playerDetector and "connected" or "MISSING"))
-  print("Ender Modem:     " .. (modem and "connected" or "MISSING"))
-  print("Print target:    " .. (printerTarget and ("computer #" .. printerTarget) or "not set"))
+  print("HTTP API:        " .. (http and "enabled" or "MISSING"))
   print("Pending lines:   " .. #pending)
   local t, d = nzTime()
   print("NZ time now:     " .. t .. "  " .. d)
@@ -149,9 +228,6 @@ local running = true
 
 local function commandLoop()
   print("Activity Logger ready. Type 'help' for commands.")
-  if not printerTarget then
-    print("(No print target set yet - use 'settarget <computerID>')")
-  end
   while running do
     write("logger> ")
     local input = read()
@@ -161,15 +237,6 @@ local function commandLoop()
 
       if cmd == "print" then
         flush(true)
-      elseif cmd == "settarget" then
-        local id = tonumber(rest)
-        if id then
-          printerTarget = id
-          saveTarget(id)
-          print("Print target set to computer #" .. id)
-        else
-          print("Usage: settarget <computerID>")
-        end
       elseif cmd == "status" then
         cmdStatus()
       elseif cmd == "recent" then
@@ -206,12 +273,15 @@ local function eventListenerWithDebug()
     if name == "chat" then
       local username, message = event[2], event[3]
       recordLine(("Chat: %s: %s"):format(tostring(username), tostring(message)))
+      postChatEmbed(tostring(username), tostring(message))
 
     elseif name == "playerJoin" then
       recordLine(("Join: %s"):format(tostring(event[2])))
+      postJoinEmbed(tostring(event[2]))
 
     elseif name == "playerLeave" then
       recordLine(("Leave: %s"):format(tostring(event[2])))
+      postLeaveEmbed(tostring(event[2]))
 
     elseif name == "timer" and event[2] == flushTimerID then
       flush(false)
