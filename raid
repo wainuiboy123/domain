@@ -1,0 +1,371 @@
+-- fetch_chest.lua
+-- CC: Tweaked turtle program
+--
+-- Carefully tunnels to a chest at a given coordinate, either loots it or
+-- breaks it (your choice), then returns home the same way it came.
+--
+-- USAGE:
+--   fetch_chest <x> <y> <z>        -- absolute world coords (needs GPS array)
+--   fetch_chest ~<dx> <dy> <dz>    -- relative to current position, no GPS
+--
+-- Safety behaviour:
+--   * Inspects every block BEFORE touching it. If it's lava or water, it
+--     tries to seal it with a block from its own inventory before digging
+--     through. If it can't seal it (no blocks to place), it stops rather
+--     than risk itself.
+--   * Checks it has enough fuel for the ROUND TRIP before it ever moves,
+--     auto-refuelling from its inventory (coal/charcoal/lava bucket/etc)
+--     if it's short. If it still doesn't have enough, it won't leave.
+--   * If a block won't break after several tries (bedrock, obsidian w/o
+--     the right tool, etc), it stops instead of digging forever.
+--   * Approaches the chest from one side rather than walking into its
+--     space, interacts with it, then returns via the same path.
+--
+-- CONFIG - edit these two lines to taste:
+local MODE = "loot"        -- "loot" = suck items out and leave the chest
+                            -- "break" = suck items out THEN break the chest
+local FUEL_SAFETY_MARGIN = 20  -- extra fuel kept in reserve beyond the calculated round trip
+
+-------------------------------------------------
+local args = { ... }
+if #args < 3 then
+    print("Usage: fetch_chest <x> <y> <z>")
+    print("       fetch_chest ~<dx> <dy> <dz>   (relative, no GPS)")
+    return
+end
+
+local useGPS = true
+local xArg = args[1]
+if xArg:sub(1,1) == "~" then
+    useGPS = false
+    xArg = xArg:sub(2)
+end
+
+local targetX = tonumber(xArg)
+local targetY = tonumber(args[2])
+local targetZ = tonumber(args[3])
+
+if not (targetX and targetY and targetZ) then
+    print("Invalid coordinates.")
+    return
+end
+
+-------------------------------------------------
+-- State: facing is 0=+z(south) 1=+x(east) 2=-z(north) 3=-x(west)
+-------------------------------------------------
+local pos = { x = 0, y = 0, z = 0 }
+local startPos = { x = 0, y = 0, z = 0 }
+local facing = 0
+
+local function calibrateFacing()
+    local x1, y1, z1 = gps.locate(2)
+    if not x1 then return false end
+
+    local moved = false
+    for _ = 1, 3 do
+        if turtle.forward() then
+            moved = true
+            break
+        else
+            turtle.dig()
+            turtle.attack()
+        end
+    end
+    if not moved then return false end
+
+    local x2, y2, z2 = gps.locate(2)
+    if not x2 then return false end
+
+    local dx, dz = x2 - x1, z2 - z1
+    if dz == 1 then facing = 0
+    elseif dx == 1 then facing = 1
+    elseif dz == -1 then facing = 2
+    elseif dx == -1 then facing = 3
+    else return false end
+
+    pos.x, pos.y, pos.z = x2, y2, z2
+    return true
+end
+
+local haveGPS = false
+if useGPS then
+    haveGPS = calibrateFacing()
+    if not haveGPS then
+        print("GPS not available/calibration failed - using relative mode.")
+        pos = { x = 0, y = 0, z = 0 }
+        facing = 0
+    end
+end
+
+startPos.x, startPos.y, startPos.z = pos.x, pos.y, pos.z
+
+-------------------------------------------------
+-- Fuel safety
+-------------------------------------------------
+local function manhattan(a, b)
+    return math.abs(a.x - b.x) + math.abs(a.y - b.y) + math.abs(a.z - b.z)
+end
+
+local function tryRefuel()
+    if turtle.getFuelLevel() == "unlimited" then return end
+    for slot = 1, 16 do
+        turtle.select(slot)
+        if turtle.refuel(0) then
+            turtle.refuel()
+        end
+    end
+    turtle.select(1)
+end
+
+local function requiredFuel()
+    local target = { x = targetX, y = targetY, z = targetZ }
+    local there = manhattan(startPos, target)
+    -- there and back, plus stopping one block short of the chest each way
+    return (there * 2) + FUEL_SAFETY_MARGIN
+end
+
+tryRefuel()
+if turtle.getFuelLevel() ~= "unlimited" then
+    local need = requiredFuel()
+    if turtle.getFuelLevel() < need then
+        print(string.format("Not enough fuel. Have %d, need ~%d for the round trip.",
+            turtle.getFuelLevel(), need))
+        print("Add fuel to the turtle's inventory and run again.")
+        return
+    end
+end
+
+-------------------------------------------------
+-- Hazard-aware digging
+-------------------------------------------------
+local LIQUID_NAMES = { ["minecraft:water"] = true, ["minecraft:lava"] = true }
+
+local function findPlaceableSlot()
+    for slot = 1, 16 do
+        local detail = turtle.getItemDetail(slot)
+        if detail and not detail.name:find("bucket") then
+            -- crude heuristic: anything that isn't a bucket/tool is assumed placeable
+            return slot
+        end
+    end
+    return nil
+end
+
+-- Returns "clear" | "hazard_sealed" | "hazard_unsealed" | "unbreakable"
+local function clearDirection(inspectFn, digFn, placeFn, detectFn)
+    local exists, data = inspectFn()
+    if not exists then
+        return "clear"
+    end
+
+    if LIQUID_NAMES[data.name] then
+        local slot = findPlaceableSlot()
+        if not slot then
+            return "hazard_unsealed"
+        end
+        turtle.select(slot)
+        placeFn()
+        turtle.select(1)
+        -- re-check: if still liquid/air weirdness, bail safely
+        local stillExists = detectFn()
+        if not stillExists then
+            return "hazard_unsealed"
+        end
+    end
+
+    -- normal solid block (or now-sealed hazard): dig with a bounded retry count
+    for attempt = 1, 5 do
+        if not detectFn() then
+            return "clear"
+        end
+        digFn()
+        sleep(0.4)
+    end
+
+    if detectFn() then
+        return "unbreakable"
+    end
+    return "clear"
+end
+
+local function haltForSafety(reason)
+    print("STOPPING for safety: " .. reason)
+    print(string.format("Turtle is currently at approx x=%d y=%d z=%d (relative to start).",
+        pos.x, pos.y, pos.z))
+    error("halted", 0)
+end
+
+local function clearForward()
+    local result = clearDirection(turtle.inspect, turtle.dig, turtle.place, turtle.detect)
+    if result == "hazard_unsealed" then
+        haltForSafety("Lava/water ahead and I have nothing in my inventory to seal it with.")
+    elseif result == "unbreakable" then
+        haltForSafety("Block ahead won't break (bedrock or wrong tool?).")
+    end
+end
+
+local function clearUp()
+    local result = clearDirection(turtle.inspectUp, turtle.digUp, turtle.placeUp, turtle.detectUp)
+    if result == "hazard_unsealed" then
+        haltForSafety("Lava/water above and nothing to seal it with.")
+    elseif result == "unbreakable" then
+        haltForSafety("Block above won't break (bedrock or wrong tool?).")
+    end
+end
+
+local function clearDown()
+    local result = clearDirection(turtle.inspectDown, turtle.digDown, turtle.placeDown, turtle.detectDown)
+    if result == "hazard_unsealed" then
+        haltForSafety("Lava/water below and nothing to seal it with.")
+    elseif result == "unbreakable" then
+        haltForSafety("Block below won't break (bedrock or wrong tool?).")
+    end
+end
+
+-------------------------------------------------
+-- Movement
+-------------------------------------------------
+local function safeForward()
+    for _ = 1, 6 do
+        clearForward()
+        if turtle.forward() then
+            if facing == 0 then pos.z = pos.z + 1
+            elseif facing == 1 then pos.x = pos.x + 1
+            elseif facing == 2 then pos.z = pos.z - 1
+            else pos.x = pos.x - 1 end
+            return true
+        end
+        turtle.attack()
+        sleep(0.3)
+    end
+    haltForSafety("Kept getting blocked moving forward (mob spam or stuck).")
+end
+
+local function safeUp()
+    for _ = 1, 6 do
+        clearUp()
+        if turtle.up() then
+            pos.y = pos.y + 1
+            return true
+        end
+        turtle.attackUp()
+        sleep(0.3)
+    end
+    haltForSafety("Kept getting blocked moving up.")
+end
+
+local function safeDown()
+    for _ = 1, 6 do
+        clearDown()
+        if turtle.down() then
+            pos.y = pos.y - 1
+            return true
+        end
+        turtle.attackDown()
+        sleep(0.3)
+    end
+    haltForSafety("Kept getting blocked moving down.")
+end
+
+local function turnRight() turtle.turnRight(); facing = (facing + 1) % 4 end
+local function turnLeft()  turtle.turnLeft();  facing = (facing - 1) % 4 end
+
+local function faceDirection(target)
+    while facing ~= target do
+        local diff = (target - facing) % 4
+        if diff == 1 then turnRight()
+        elseif diff == 3 then turnLeft()
+        else turnRight(); turnRight() end
+    end
+end
+
+local function dumpIfFull()
+    for slot = 1, 16 do
+        if turtle.getItemCount(slot) == 0 then return end
+    end
+    print("Inventory full - dropping oldest stack to keep moving.")
+    turtle.select(1)
+    turtle.drop()
+    turtle.select(1)
+end
+
+local function checkFuelMidway(target)
+    if turtle.getFuelLevel() == "unlimited" then return end
+    tryRefuel()
+    local backHome = manhattan(pos, startPos)
+    if turtle.getFuelLevel() < backHome + 5 then
+        haltForSafety("Fuel getting too low to guarantee getting home. Stopping here.")
+    end
+end
+
+local function moveAxisY(target)
+    while pos.y < target do dumpIfFull(); checkFuelMidway(); safeUp() end
+    while pos.y > target do dumpIfFull(); checkFuelMidway(); safeDown() end
+end
+
+local function moveAxisX(target)
+    if pos.x == target then return end
+    faceDirection(pos.x < target and 1 or 3)
+    while pos.x ~= target do dumpIfFull(); checkFuelMidway(); safeForward() end
+end
+
+local function moveAxisZ(target)
+    if pos.z == target then return end
+    faceDirection(pos.z < target and 0 or 2)
+    while pos.z ~= target do dumpIfFull(); checkFuelMidway(); safeForward() end
+end
+
+local function moveTo(x, y, z)
+    moveAxisY(y)
+    moveAxisX(x)
+    moveAxisZ(z)
+end
+
+-------------------------------------------------
+-- Main
+-------------------------------------------------
+print(string.format("Start: x=%d y=%d z=%d", pos.x, pos.y, pos.z))
+print(string.format("Chest: x=%d y=%d z=%d", targetX, targetY, targetZ))
+
+-- Approach from the south side (one block short on Z) so we don't walk
+-- into the chest's own space.
+local approachX, approachY, approachZ = targetX, targetY, targetZ - 1
+
+local ok, err = pcall(function()
+    moveTo(approachX, approachY, approachZ)
+    faceDirection(0) -- look north, toward the chest
+
+    -- confirm there's actually something there before interacting
+    local exists = turtle.detect()
+    if not exists then
+        print("Nothing found at that coordinate - continuing anyway to check.")
+    end
+
+    -- loot: suck repeatedly until the chest is empty
+    print("Looting chest...")
+    local pulledSomething = true
+    while pulledSomething do
+        dumpIfFull()
+        pulledSomething = turtle.suck()
+    end
+
+    if MODE == "break" then
+        print("Breaking chest...")
+        clearForward() -- will dig it now that it's empty
+    end
+
+    print("Heading home...")
+    moveTo(startPos.x, startPos.y, startPos.z)
+    faceDirection(0)
+end)
+
+if not ok then
+    print("Run ended early: " .. tostring(err))
+    print("Attempting to return home from current position...")
+    pcall(function()
+        moveTo(startPos.x, startPos.y, startPos.z)
+    end)
+    return
+end
+
+print("Done. Back home with the loot.")
