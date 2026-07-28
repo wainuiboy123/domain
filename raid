@@ -1,47 +1,29 @@
 -- fetch_chest.lua
 -- CC: Tweaked turtle program
 --
--- Carefully tunnels to a chest at a given coordinate, either loots it or
--- breaks it (your choice), then returns home the same way it came.
+-- Carefully tunnels to a chest at a given coordinate, loots or breaks it,
+-- then returns home. No GPS required - you tell it where it's starting.
 --
 -- USAGE:
---   fetch_chest <x> <y> <z>        -- absolute world coords (needs GPS array)
---   fetch_chest ~<dx> <dy> <dz>    -- relative to current position, no GPS
+--   fetch_chest <x> <y> <z>
+-- It will then prompt you for the turtle's CURRENT x/y/z/facing so it can
+-- work out how far and which way to go.
 --
--- Safety behaviour:
---   * Inspects every block BEFORE touching it. If it's lava or water, it
---     tries to seal it with a block from its own inventory before digging
---     through. If it can't seal it (no blocks to place), it stops rather
---     than risk itself.
---   * Checks it has enough fuel for the ROUND TRIP before it ever moves,
---     auto-refuelling from its inventory (coal/charcoal/lava bucket/etc)
---     if it's short. If it still doesn't have enough, it won't leave.
---   * If a block won't break after several tries (bedrock, obsidian w/o
---     the right tool, etc), it stops instead of digging forever.
---   * Approaches the chest from one side rather than walking into its
---     space, interacts with it, then returns via the same path.
---
--- CONFIG - edit these two lines to taste:
-local MODE = "loot"        -- "loot" = suck items out and leave the chest
-                            -- "break" = suck items out THEN break the chest
-local FUEL_SAFETY_MARGIN = 20  -- extra fuel kept in reserve beyond the calculated round trip
+-- CONFIG:
+local MODE = "loot"            -- "loot" = suck items out and leave the chest
+                                -- "break" = suck items out THEN break the chest
+local FUEL_SAFETY_MARGIN = 20  -- reserve fuel kept beyond the calculated round trip
+local FUEL_CHECK_EVERY = 8     -- only re-check fuel every N blocks (speed)
+local INV_CHECK_EVERY = 8      -- only check inventory fullness every N blocks (speed)
 
 -------------------------------------------------
 local args = { ... }
 if #args < 3 then
     print("Usage: fetch_chest <x> <y> <z>")
-    print("       fetch_chest ~<dx> <dy> <dz>   (relative, no GPS)")
     return
 end
 
-local useGPS = true
-local xArg = args[1]
-if xArg:sub(1,1) == "~" then
-    useGPS = false
-    xArg = xArg:sub(2)
-end
-
-local targetX = tonumber(xArg)
+local targetX = tonumber(args[1])
 local targetY = tonumber(args[2])
 local targetZ = tonumber(args[3])
 
@@ -51,53 +33,43 @@ if not (targetX and targetY and targetZ) then
 end
 
 -------------------------------------------------
--- State: facing is 0=+z(south) 1=+x(east) 2=-z(north) 3=-x(west)
+-- Ask the user where the turtle currently is
 -------------------------------------------------
-local pos = { x = 0, y = 0, z = 0 }
-local startPos = { x = 0, y = 0, z = 0 }
-local facing = 0
+local function askNumber(prompt)
+    while true do
+        io.write(prompt .. ": ")
+        local input = read()
+        local n = tonumber(input)
+        if n then return n end
+        print("Please enter a number.")
+    end
+end
 
-local function calibrateFacing()
-    local x1, y1, z1 = gps.locate(2)
-    if not x1 then return false end
-
-    local moved = false
-    for _ = 1, 3 do
-        if turtle.forward() then
-            moved = true
-            break
-        else
-            turtle.dig()
-            turtle.attack()
+local function askFacing()
+    while true do
+        io.write("Which way is the turtle facing right now? (north/south/east/west): ")
+        local input = read()
+        if input then
+            input = input:lower()
+            if input == "north" then return 2
+            elseif input == "south" then return 0
+            elseif input == "east" then return 1
+            elseif input == "west" then return 3
+            end
         end
-    end
-    if not moved then return false end
-
-    local x2, y2, z2 = gps.locate(2)
-    if not x2 then return false end
-
-    local dx, dz = x2 - x1, z2 - z1
-    if dz == 1 then facing = 0
-    elseif dx == 1 then facing = 1
-    elseif dz == -1 then facing = 2
-    elseif dx == -1 then facing = 3
-    else return false end
-
-    pos.x, pos.y, pos.z = x2, y2, z2
-    return true
-end
-
-local haveGPS = false
-if useGPS then
-    haveGPS = calibrateFacing()
-    if not haveGPS then
-        print("GPS not available/calibration failed - using relative mode.")
-        pos = { x = 0, y = 0, z = 0 }
-        facing = 0
+        print("Please type north, south, east, or west.")
     end
 end
 
-startPos.x, startPos.y, startPos.z = pos.x, pos.y, pos.z
+print("Where is the turtle right now?")
+local startPos = {
+    x = askNumber("Current X"),
+    y = askNumber("Current Y"),
+    z = askNumber("Current Z"),
+}
+local facing = askFacing()
+
+local pos = { x = startPos.x, y = startPos.y, z = startPos.z }
 
 -------------------------------------------------
 -- Fuel safety
@@ -117,16 +89,10 @@ local function tryRefuel()
     turtle.select(1)
 end
 
-local function requiredFuel()
-    local target = { x = targetX, y = targetY, z = targetZ }
-    local there = manhattan(startPos, target)
-    -- there and back, plus stopping one block short of the chest each way
-    return (there * 2) + FUEL_SAFETY_MARGIN
-end
-
 tryRefuel()
 if turtle.getFuelLevel() ~= "unlimited" then
-    local need = requiredFuel()
+    local there = manhattan(startPos, { x = targetX, y = targetY, z = targetZ })
+    local need = (there * 2) + FUEL_SAFETY_MARGIN
     if turtle.getFuelLevel() < need then
         print(string.format("Not enough fuel. Have %d, need ~%d for the round trip.",
             turtle.getFuelLevel(), need))
@@ -144,61 +110,44 @@ local function findPlaceableSlot()
     for slot = 1, 16 do
         local detail = turtle.getItemDetail(slot)
         if detail and not detail.name:find("bucket") then
-            -- crude heuristic: anything that isn't a bucket/tool is assumed placeable
             return slot
         end
     end
     return nil
 end
 
--- Returns "clear" | "hazard_sealed" | "hazard_unsealed" | "unbreakable"
 local function clearDirection(inspectFn, digFn, placeFn, detectFn)
     local exists, data = inspectFn()
-    if not exists then
-        return "clear"
-    end
+    if not exists then return "clear" end
 
     if LIQUID_NAMES[data.name] then
         local slot = findPlaceableSlot()
-        if not slot then
-            return "hazard_unsealed"
-        end
+        if not slot then return "hazard_unsealed" end
         turtle.select(slot)
         placeFn()
         turtle.select(1)
-        -- re-check: if still liquid/air weirdness, bail safely
-        local stillExists = detectFn()
-        if not stillExists then
-            return "hazard_unsealed"
-        end
+        if not detectFn() then return "hazard_unsealed" end
     end
 
-    -- normal solid block (or now-sealed hazard): dig with a bounded retry count
-    for attempt = 1, 5 do
-        if not detectFn() then
-            return "clear"
-        end
+    for attempt = 1, 4 do
+        if not detectFn() then return "clear" end
         digFn()
-        sleep(0.4)
     end
 
-    if detectFn() then
-        return "unbreakable"
-    end
+    if detectFn() then return "unbreakable" end
     return "clear"
 end
 
 local function haltForSafety(reason)
     print("STOPPING for safety: " .. reason)
-    print(string.format("Turtle is currently at approx x=%d y=%d z=%d (relative to start).",
-        pos.x, pos.y, pos.z))
+    print(string.format("Turtle is currently at approx x=%d y=%d z=%d.", pos.x, pos.y, pos.z))
     error("halted", 0)
 end
 
 local function clearForward()
     local result = clearDirection(turtle.inspect, turtle.dig, turtle.place, turtle.detect)
     if result == "hazard_unsealed" then
-        haltForSafety("Lava/water ahead and I have nothing in my inventory to seal it with.")
+        haltForSafety("Lava/water ahead and I have nothing to seal it with.")
     elseif result == "unbreakable" then
         haltForSafety("Block ahead won't break (bedrock or wrong tool?).")
     end
@@ -223,8 +172,10 @@ local function clearDown()
 end
 
 -------------------------------------------------
--- Movement
+-- Movement (no artificial sleeps - only retries when actually blocked)
 -------------------------------------------------
+local blockCounter = 0
+
 local function safeForward()
     for _ = 1, 6 do
         clearForward()
@@ -236,7 +187,6 @@ local function safeForward()
             return true
         end
         turtle.attack()
-        sleep(0.3)
     end
     haltForSafety("Kept getting blocked moving forward (mob spam or stuck).")
 end
@@ -249,7 +199,6 @@ local function safeUp()
             return true
         end
         turtle.attackUp()
-        sleep(0.3)
     end
     haltForSafety("Kept getting blocked moving up.")
 end
@@ -262,7 +211,6 @@ local function safeDown()
             return true
         end
         turtle.attackDown()
-        sleep(0.3)
     end
     haltForSafety("Kept getting blocked moving down.")
 end
@@ -271,12 +219,10 @@ local function turnRight() turtle.turnRight(); facing = (facing + 1) % 4 end
 local function turnLeft()  turtle.turnLeft();  facing = (facing - 1) % 4 end
 
 local function faceDirection(target)
-    while facing ~= target do
-        local diff = (target - facing) % 4
-        if diff == 1 then turnRight()
-        elseif diff == 3 then turnLeft()
-        else turnRight(); turnRight() end
-    end
+    local diff = (target - facing) % 4
+    if diff == 1 then turnRight()
+    elseif diff == 2 then turnRight(); turnRight()
+    elseif diff == 3 then turnLeft() end
 end
 
 local function dumpIfFull()
@@ -289,30 +235,33 @@ local function dumpIfFull()
     turtle.select(1)
 end
 
-local function checkFuelMidway(target)
-    if turtle.getFuelLevel() == "unlimited" then return end
-    tryRefuel()
-    local backHome = manhattan(pos, startPos)
-    if turtle.getFuelLevel() < backHome + 5 then
-        haltForSafety("Fuel getting too low to guarantee getting home. Stopping here.")
+local function periodicChecks()
+    blockCounter = blockCounter + 1
+    if blockCounter % INV_CHECK_EVERY == 0 then dumpIfFull() end
+    if blockCounter % FUEL_CHECK_EVERY == 0 and turtle.getFuelLevel() ~= "unlimited" then
+        tryRefuel()
+        local backHome = manhattan(pos, startPos)
+        if turtle.getFuelLevel() < backHome + 5 then
+            haltForSafety("Fuel getting too low to guarantee getting home. Stopping here.")
+        end
     end
 end
 
 local function moveAxisY(target)
-    while pos.y < target do dumpIfFull(); checkFuelMidway(); safeUp() end
-    while pos.y > target do dumpIfFull(); checkFuelMidway(); safeDown() end
+    while pos.y < target do periodicChecks(); safeUp() end
+    while pos.y > target do periodicChecks(); safeDown() end
 end
 
 local function moveAxisX(target)
     if pos.x == target then return end
     faceDirection(pos.x < target and 1 or 3)
-    while pos.x ~= target do dumpIfFull(); checkFuelMidway(); safeForward() end
+    while pos.x ~= target do periodicChecks(); safeForward() end
 end
 
 local function moveAxisZ(target)
     if pos.z == target then return end
     faceDirection(pos.z < target and 0 or 2)
-    while pos.z ~= target do dumpIfFull(); checkFuelMidway(); safeForward() end
+    while pos.z ~= target do periodicChecks(); safeForward() end
 end
 
 local function moveTo(x, y, z)
@@ -335,13 +284,6 @@ local ok, err = pcall(function()
     moveTo(approachX, approachY, approachZ)
     faceDirection(0) -- look north, toward the chest
 
-    -- confirm there's actually something there before interacting
-    local exists = turtle.detect()
-    if not exists then
-        print("Nothing found at that coordinate - continuing anyway to check.")
-    end
-
-    -- loot: suck repeatedly until the chest is empty
     print("Looting chest...")
     local pulledSomething = true
     while pulledSomething do
@@ -351,7 +293,7 @@ local ok, err = pcall(function()
 
     if MODE == "break" then
         print("Breaking chest...")
-        clearForward() -- will dig it now that it's empty
+        clearForward()
     end
 
     print("Heading home...")
