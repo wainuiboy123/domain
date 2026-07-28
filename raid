@@ -2,12 +2,17 @@
 -- CC: Tweaked turtle program
 --
 -- Carefully tunnels to a chest at a given coordinate, loots or breaks it,
--- then returns home. No GPS required - you tell it where it's starting.
+-- then returns home.
 --
 -- USAGE:
 --   fetch_chest <x> <y> <z>
--- It will then prompt you for the turtle's CURRENT x/y/z/facing so it can
--- work out how far and which way to go.
+--
+-- It will first try GPS (gps.locate()). If that fails (no GPS host array
+-- in range, or no modem attached), it will ask you for the turtle's
+-- current x/y/z/facing instead.
+--
+-- FACING CONVENTION (matches Minecraft's compass):
+--   0 = north (-Z)   1 = east (+X)   2 = south (+Z)   3 = west (-X)
 --
 -- CONFIG:
 local MODE = "loot"            -- "loot" = suck items out and leave the chest
@@ -33,8 +38,12 @@ if not (targetX and targetY and targetZ) then
 end
 
 -------------------------------------------------
--- Ask the user where the turtle currently is
+-- Facing: 0=north(-Z) 1=east(+X) 2=south(+Z) 3=west(-X)
 -------------------------------------------------
+local facing
+local startPos = {}
+local pos
+
 local function askNumber(prompt)
     while true do
         io.write(prompt .. ": ")
@@ -51,9 +60,9 @@ local function askFacing()
         local input = read()
         if input then
             input = input:lower()
-            if input == "north" then return 2
-            elseif input == "south" then return 0
+            if input == "north" then return 0
             elseif input == "east" then return 1
+            elseif input == "south" then return 2
             elseif input == "west" then return 3
             end
         end
@@ -61,15 +70,56 @@ local function askFacing()
     end
 end
 
-print("Where is the turtle right now?")
-local startPos = {
-    x = askNumber("Current X"),
-    y = askNumber("Current Y"),
-    z = askNumber("Current Z"),
-}
-local facing = askFacing()
+-- Try GPS first. Calibrate facing by moving one block and comparing
+-- positions (GPS gives position, not heading).
+local function tryGPSSetup()
+    if not turtle then return false end
+    local ok = pcall(function() return peripheral.find("modem") end)
+    if not ok or not peripheral.find("modem") then return false end
 
-local pos = { x = startPos.x, y = startPos.y, z = startPos.z }
+    local x1, y1, z1 = gps.locate(2)
+    if not x1 then return false end
+
+    local moved = false
+    for _ = 1, 3 do
+        if turtle.forward() then
+            moved = true
+            break
+        else
+            turtle.dig()
+            turtle.attack()
+        end
+    end
+    if not moved then return false end
+
+    local x2, y2, z2 = gps.locate(2)
+    if not x2 then return false end
+
+    local dx, dz = x2 - x1, z2 - z1
+    if dz == -1 then facing = 0       -- moved north
+    elseif dx == 1 then facing = 1    -- moved east
+    elseif dz == 1 then facing = 2    -- moved south
+    elseif dx == -1 then facing = 3   -- moved west
+    else return false end
+
+    startPos = { x = x1, y = y1, z = z1 }
+    pos = { x = x2, y = y2, z = z2 }
+    return true
+end
+
+print("Looking for GPS...")
+if tryGPSSetup() then
+    print("GPS found. Calibrated successfully.")
+else
+    print("No GPS available - please enter position manually.")
+    startPos = {
+        x = askNumber("Current X"),
+        y = askNumber("Current Y"),
+        z = askNumber("Current Z"),
+    }
+    facing = askFacing()
+    pos = { x = startPos.x, y = startPos.y, z = startPos.z }
+end
 
 -------------------------------------------------
 -- Fuel safety
@@ -172,7 +222,7 @@ local function clearDown()
 end
 
 -------------------------------------------------
--- Movement (no artificial sleeps - only retries when actually blocked)
+-- Movement
 -------------------------------------------------
 local blockCounter = 0
 
@@ -180,10 +230,10 @@ local function safeForward()
     for _ = 1, 6 do
         clearForward()
         if turtle.forward() then
-            if facing == 0 then pos.z = pos.z + 1
-            elseif facing == 1 then pos.x = pos.x + 1
-            elseif facing == 2 then pos.z = pos.z - 1
-            else pos.x = pos.x - 1 end
+            if facing == 0 then pos.z = pos.z - 1       -- north
+            elseif facing == 1 then pos.x = pos.x + 1   -- east
+            elseif facing == 2 then pos.z = pos.z + 1   -- south
+            else pos.x = pos.x - 1 end                   -- west
             return true
         end
         turtle.attack()
@@ -215,6 +265,7 @@ local function safeDown()
     haltForSafety("Kept getting blocked moving down.")
 end
 
+-- Clockwise: north(0) -> east(1) -> south(2) -> west(3) -> north(0)
 local function turnRight() turtle.turnRight(); facing = (facing + 1) % 4 end
 local function turnLeft()  turtle.turnLeft();  facing = (facing - 1) % 4 end
 
@@ -254,13 +305,13 @@ end
 
 local function moveAxisX(target)
     if pos.x == target then return end
-    faceDirection(pos.x < target and 1 or 3)
+    faceDirection(pos.x < target and 1 or 3)  -- east or west
     while pos.x ~= target do periodicChecks(); safeForward() end
 end
 
 local function moveAxisZ(target)
     if pos.z == target then return end
-    faceDirection(pos.z < target and 0 or 2)
+    faceDirection(pos.z < target and 2 or 0)  -- south or north
     while pos.z ~= target do periodicChecks(); safeForward() end
 end
 
@@ -276,13 +327,13 @@ end
 print(string.format("Start: x=%d y=%d z=%d", pos.x, pos.y, pos.z))
 print(string.format("Chest: x=%d y=%d z=%d", targetX, targetY, targetZ))
 
--- Approach from the south side (one block short on Z) so we don't walk
--- into the chest's own space.
+-- Approach from the north side (one block short on Z) so we don't walk
+-- into the chest's own space, then face south into it.
 local approachX, approachY, approachZ = targetX, targetY, targetZ - 1
 
 local ok, err = pcall(function()
     moveTo(approachX, approachY, approachZ)
-    faceDirection(0) -- look north, toward the chest
+    faceDirection(2) -- face south, toward the chest
 
     print("Looting chest...")
     local pulledSomething = true
@@ -298,7 +349,6 @@ local ok, err = pcall(function()
 
     print("Heading home...")
     moveTo(startPos.x, startPos.y, startPos.z)
-    faceDirection(0)
 end)
 
 if not ok then
