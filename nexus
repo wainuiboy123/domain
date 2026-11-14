@@ -1,5 +1,5 @@
 --=====================================================================
---  NEXUS TRACKER  v2.9.1   -  black & orange pixel UI
+--  NEXUS TRACKER  v2.9.2   -  black & orange pixel UI
 --  CC:Tweaked + Advanced Peripherals + CC: Graphics  (NeoForge 1.21.1)
 --
 --  Needs: Advanced Monitor (6x3), Chat Box, Player Detector, NBT Storage
@@ -1327,14 +1327,21 @@ local function callMove(mgr, fn, dir, filter)
     local f = (fn == "removeItemFromPlayer") and "exportItem" or "importItem"
     if CONFIG.SWAP_IMPORT_EXPORT then f = (f == "exportItem") and "importItem" or "exportItem" end
     local shifts = (data.inv.shift == -1) and { -1, 0 } or { 0, -1 }
+    local tries = {}
+    for _, sh in ipairs(shifts) do tries[#tries + 1] = { sh, true } end
+    if filter.toSlot then       -- fallback: if the exact target slot is refused, let the game choose it
+      for _, sh in ipairs(shifts) do tries[#tries + 1] = { sh, false } end
+    end
     local lastErr
-    for _, sh in ipairs(shifts) do
+    for _, tr in ipairs(tries) do
+      local sh, useTo = tr[1], tr[2]
       local flt = { name = filter.name, count = filter.count }
       if filter.fromSlot then flt.fromSlot = filter.fromSlot + sh end
-      if filter.toSlot then flt.toSlot = filter.toSlot + sh end
+      if useTo and filter.toSlot then flt.toSlot = filter.toSlot + sh end
       local n, err = try(f, dir, flt)
       if n and n > 0 then
         if data.inv.shift ~= sh then data.inv.shift = sh; dirty = true end   -- remember slot numbering
+        if filter.toSlot and not useTo then inv.note = "TARGET SLOT NOT SUPPORTED - PLACED IN NEXT FREE SLOT" end
         return n
       end
       lastErr = err
@@ -1364,6 +1371,22 @@ local function callMove(mgr, fn, dir, filter)
   local n, err = try(fn, dir, filter)                   -- Advanced Peripherals 0.7.x (filter table)
   if n == nil and filter.fromSlot then                  -- older versions: (dir, count, slot)
     n, err = try(fn, dir, filter.count, filter.fromSlot)
+  end
+  -- FIX v3.0: the call was accepted but moved 0 items -> usually a slot-numbering mismatch.
+  -- Retry one slot either side, then by item name alone (only safe when we know the name).
+  if n == 0 and filter.name then
+    if filter.fromSlot then
+      for _, sh in ipairs({ -1, 1 }) do
+        local f2 = { name = filter.name, count = filter.count, fromSlot = filter.fromSlot + sh }
+        local n2 = try(fn, dir, f2)
+        if n2 and n2 > 0 then return n2 end
+      end
+    end
+    local n3 = try(fn, dir, { name = filter.name, count = filter.count })
+    if n3 and n3 > 0 then return n3 end
+  end
+  if n == 0 and (err == nil or err == "") then
+    err = "accepted by '" .. tostring(dir) .. "' but 0 items moved (target full/blocked?)"
   end
   return n, err
 end
@@ -1464,6 +1487,7 @@ local function mv(st, mgr, fs, fslot, ts, tslot, cnt, avoid, name)
 end
 
 function invPlace(side, slot)
+  inv.note = nil
   local mgr, pk = inv.sel, inv.pick
   local st = mgr and inv.cache[mgr]
   if not st or not pk then return end
@@ -1497,7 +1521,7 @@ function invPlace(side, slot)
     end
   end
   if n and n > 0 then
-    invFlash("MOVED " .. n .. "x " .. (a.disp or (a.name:gsub("^.-:", ""))), true)
+    invFlash("MOVED " .. n .. "x " .. (a.disp or (a.name:gsub("^.-:", ""))) .. (inv.note and ("  (" .. inv.note .. ")") or ""), true)
   else
     invFlash("FAILED: " .. tostring(err), false)
   end
