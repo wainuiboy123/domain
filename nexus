@@ -1,5 +1,5 @@
 --=====================================================================
---  NEXUS TRACKER  v2.9.2   -  black & orange pixel UI
+--  NEXUS TRACKER  v3.0   -  black & orange pixel UI
 --  CC:Tweaked + Advanced Peripherals + CC: Graphics  (NeoForge 1.21.1)
 --
 --  Needs: Advanced Monitor (6x3), Chat Box, Player Detector, NBT Storage
@@ -11,7 +11,7 @@
 --=====================================================================
 
 local CONFIG = {
-  PIN            = "421209", -- 6 digits
+  PIN            = "421263", -- 6 digits
   LOCK_AFTER     = 180,      -- seconds idle before auto-lock
   TEXT_SCALE     = 0.5,      -- monitor text scale (sets pixel resolution)
   GFX_MODE       = 2,        -- CC: Graphics mode (2 = 256 colours)
@@ -1368,49 +1368,81 @@ local function callMove(mgr, fn, dir, filter)
     table.sort(have)
     return nil, "manager has no " .. fn .. " (has: " .. table.concat(have, ", ") .. ")"
   end
-  local n, err = try(fn, dir, filter)                   -- Advanced Peripherals 0.7.x (filter table)
-  if n == nil and filter.fromSlot then                  -- older versions: (dir, count, slot)
-    n, err = try(fn, dir, filter.count, filter.fromSlot)
-  end
-  -- FIX v3.0: the call was accepted but moved 0 items -> usually a slot-numbering mismatch.
-  -- Retry one slot either side, then by item name alone (only safe when we know the name).
-  if n == 0 and filter.name then
-    if filter.fromSlot then
-      for _, sh in ipairs({ -1, 1 }) do
-        local f2 = { name = filter.name, count = filter.count, fromSlot = filter.fromSlot + sh }
-        local n2 = try(fn, dir, f2)
-        if n2 and n2 > 0 then return n2 end
-      end
+  -- Advanced Peripherals 0.7.x: fn(inventoryTarget, filterTable). Try the exact filter first, then
+  -- progressively looser versions so a slot-numbering mismatch or a refused target slot can't block the move.
+  local variants = { filter }
+  if filter.name then
+    local function mk(fs, ts)
+      local f = { name = filter.name, count = filter.count }
+      if fs then f.fromSlot = fs end
+      if ts then f.toSlot = ts end
+      return f
     end
-    local n3 = try(fn, dir, { name = filter.name, count = filter.count })
-    if n3 and n3 > 0 then return n3 end
+    if filter.fromSlot then
+      variants[#variants + 1] = mk(filter.fromSlot - 1, filter.toSlot)
+      variants[#variants + 1] = mk(filter.fromSlot + 1, filter.toSlot)
+    end
+    if filter.toSlot then
+      if filter.fromSlot then variants[#variants + 1] = mk(filter.fromSlot, nil) end   -- let the game pick the target slot
+    end
+    variants[#variants + 1] = mk(nil, nil)                                               -- by item name alone
   end
-  if n == 0 and (err == nil or err == "") then
-    err = "accepted by '" .. tostring(dir) .. "' but 0 items moved (target full/blocked?)"
+  local firstErr
+  for i, flt in ipairs(variants) do
+    local n, err = try(fn, dir, flt)
+    if n and n > 0 then
+      if i > 1 and filter.toSlot and not flt.toSlot then inv.note = "TARGET SLOT REFUSED - PLACED IN NEXT FREE SLOT" end
+      return n
+    end
+    if n == nil then                                    -- hard error (target missing, wrong arguments ...)
+      if filter.fromSlot and i == 1 and not tostring(err):find("Target", 1, true) then
+        local n2, err2 = try(fn, dir, filter.count, filter.fromSlot)   -- older versions: (dir, count, slot)
+        if n2 and n2 > 0 then return n2 end
+        err = err2 or err
+      end
+      return nil, firstErr or err
+    end
+    if err and err ~= "" and not firstErr then firstErr = err end
   end
-  return n, err
+  return 0, firstErr or ("'" .. tostring(dir) .. "' accepted the call but moved 0 items (target full or slot mismatch?)")
 end
 
 local function transfer(mgr, fn, filter)
   local d = data.inv.dir[mgr] or "auto"
-  local dirs = {}
-  for _, v in ipairs((d == "auto") and AUTODIRS or { d }) do dirs[#dirs + 1] = v end
   local cn = chestFor(mgr)
-  if cn then
-    local mm0 = mgrMethods(mgr)
-    if mm0.importItem and mm0.exportItem and not mm0.addItemToPlayer then table.insert(dirs, 1, cn)
-    else dirs[#dirs + 1] = cn end
-  end            -- newer versions can also move by peripheral name
-  local errs, seen = {}, {}
+  local dirs, have = {}, {}
+  local function add(v) if v and not have[v] then have[v] = true; dirs[#dirs + 1] = v end end
+  -- a fixed side chosen with the DIR button goes first; then the chest by peripheral name
+  -- (the only form that works on a wired network); the six sides are a last resort
+  if d ~= "auto" then add(d) end
+  add(cn)
+  if not data.inv.chest[mgr] then for _, c in ipairs(inv.cands) do add(c) end end
+  if d == "auto" then for _, v in ipairs(AUTODIRS) do add(v) end end
+  local isChest = {}
+  for _, c in ipairs(inv.cands) do isChest[c] = true end
+  if cn then isChest[cn] = true end
+  local errs, seen, sideFail = {}, {}, {}
   for _, dir in ipairs(dirs) do
     local n, err = callMove(mgr, fn, dir, filter)
     if n and n > 0 then
-      if d == "auto" and dir ~= cn then data.inv.dir[mgr] = dir; dirty = true end   -- remember what worked
+      if isChest[dir] then
+        if d == "auto" and not data.inv.chest[mgr] and dir ~= cn then data.inv.chest[mgr] = dir; dirty = true end
+      elseif d == "auto" then
+        data.inv.dir[mgr] = dir; dirty = true      -- remember the side that worked
+      end
       return n
     end
-    if err and err ~= "" and not seen[err] then seen[err] = true; errs[#errs + 1] = err end
+    if err and err ~= "" then
+      if not isChest[dir] and tostring(err):find("^Target '.-' does not exist") then
+        sideFail[#sideFail + 1] = tostring(dir)    -- collapse the six "side does not exist" errors into one
+      else
+        local msg = isChest[dir] and (tostring(dir) .. ": " .. err) or err
+        if not seen[msg] then seen[msg] = true; errs[#errs + 1] = msg end
+      end
+    end
   end
-  local full = (#errs > 0) and table.concat(errs, " | ") or "no inventory touching the manager on that side?"
+  if #sideFail > 0 then errs[#errs + 1] = "sides (" .. table.concat(sideFail, ",") .. ") are not valid targets" end
+  local full = (#errs > 0) and table.concat(errs, " | ") or "no inventory reachable from the manager (is the chest on the wired network?)"
   logErr("move " .. fn .. ": " .. full)
   local short = {}
   for i = 1, math.min(3, #errs) do short[i] = errs[i] end
