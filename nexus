@@ -1,5 +1,5 @@
 --=====================================================================
---  NEXUS TRACKER  v2.4   -  black & orange pixel UI
+--  NEXUS TRACKER  v2.5   -  black & orange pixel UI
 --  CC:Tweaked + Advanced Peripherals + CC: Graphics  (NeoForge 1.21.1)
 --
 --  Needs: Advanced Monitor (6x3), Chat Box, Player Detector, NBT Storage
@@ -108,8 +108,10 @@ end
 
 mon.setTextScale(CONFIG.TEXT_SCALE)
 local W, H = mon.getSize()
-local okg, eg = pcall(mon.setGraphicsMode, CONFIG.GFX_MODE)
-if not okg then error("setGraphicsMode failed: " .. tostring(eg), 0) end
+do
+  local okg, eg = pcall(mon.setGraphicsMode, CONFIG.GFX_MODE)
+  if not okg then error("setGraphicsMode failed: " .. tostring(eg), 0) end
+end
 local PXW, PXH = mon.getSize(true)
 if type(PXW) ~= "number" or PXW <= W then PXW, PXH = W * 6, H * 9 end
 if PXH < 250 then error("Monitor too small (" .. PXW .. "x" .. PXH .. " px). Use 6x3.", 0) end
@@ -416,6 +418,8 @@ local function wrapPx(s, maxw)
 end
 
 -- icons -------------------------------------------------------------
+local icon, iconSize
+do
 local TRI_L = "....#/...##/..###/.####/#####/.####/..###/...##/....#"
 local TRI_R = "#..../##.../###../####./#####/####./###../##.../#...."
 local function combine(a, b, gap)
@@ -436,7 +440,7 @@ local ICON = {
   menu = "#######/......./#######/......./#######",
   up = "...#.../..###../.#####./#######", down = "#######/.#####./..###../...#...",
 }
-local function icon(x, y, name, fg, bg, sc)
+function icon(x, y, name, fg, bg, sc)
   sc = sc or 1
   local rows, w = {}, 0
   for r in ICON[name]:gmatch("[^/]+") do rows[#rows + 1] = r; w = max(w, #r) end
@@ -451,16 +455,19 @@ local function icon(x, y, name, fg, bg, sc)
   put(floor(x), floor(y), out)
   return w * sc, #rows * sc
 end
-local function iconSize(name, sc)
+function iconSize(name, sc)
   local w, h = 0, 0
   for r in ICON[name]:gmatch("[^/]+") do w = max(w, #r); h = h + 1 end
   return w * (sc or 1), h * (sc or 1)
 end
+end -- do (icons)
 
 --------------------------------------------------------------------
 -- ITEM ICONS  (procedural 16x16 pixel art - CC cannot load game textures,
 -- so every item gets a shape picked from its id + a colour from its material)
 --------------------------------------------------------------------
+local itemIcon
+do
 local CCDEF = { 0xF0F0F0, 0xF2B233, 0xE57FD8, 0x99B2F2, 0xDEDE6C, 0x7FCC19, 0xF2B2CC, 0x4C4C4C,
                 0x999999, 0x4C99B2, 0xB266E5, 0x3366CC, 0x7F664C, 0x57A64E, 0xCC4C4C, 0x111111 }
 local POOL, poolN = {}, 0
@@ -671,7 +678,7 @@ local function stamp(rows)
 end
 
 local icache = {}
-local function itemIcon(name, bgIdx)
+function itemIcon(name, bgIdx)
   local key = name .. ":" .. bgIdx
   local cached = icache[key]
   if cached then return cached end
@@ -730,6 +737,7 @@ local function itemIcon(name, bgIdx)
   icache[key] = rows
   return rows
 end
+end -- do (item icons)
 
 --------------------------------------------------------------------
 -- data model + persistence
@@ -1882,9 +1890,11 @@ local function playerDims(s)
   return out
 end
 
+local sampleIndex, activeDuration, buildHeat
+do
 local STEPS = { 16, 32, 50, 100, 200, 250, 500, 1000, 2000, 5000, 10000, 50000 }
 
-local function sampleIndex(s, tp)          -- last sample whose time <= tp
+function sampleIndex(s, tp)          -- last sample whose time <= tp
   local lo, hi, idx = 1, #s, 0
   while lo <= hi do
     local mid = floor((lo + hi) / 2)
@@ -1900,7 +1910,7 @@ local function nice(v)                       -- stepped sizes so the view only r
 end
 
 local ACT = {}
-local function activeDuration(s)             -- tracked time excluding long idle gaps
+function activeDuration(s)             -- tracked time excluding long idle gaps
   if ACT.s == s and ACT.n == #s then return ACT.dur end
   local d = 0
   for i = 2, #s do
@@ -1913,7 +1923,7 @@ end
 
 local HB, HC = {}, {}    -- bounds cache, accumulated heat cache (both incremental)
 
-local function buildHeat(s, tp, dimSel, PW, PH)
+function buildHeat(s, tp, dimSel, PW, PH)
   local idx = sampleIndex(s, tp)
   if idx == 0 then return nil end
   local dim = dimSel or s[idx][4]
@@ -2029,6 +2039,7 @@ local function buildHeat(s, tp, dimSel, PW, PH)
   return { pix = pix, idx = idx, dim = dim, minX = minX, minZ = minZ,
            maxX = minX + extX, maxZ = minZ + extZ, scale = scale, cur = cur, step = step }
 end
+end -- do (heat)
 
 local HL = {}
 local PIECE = {}
