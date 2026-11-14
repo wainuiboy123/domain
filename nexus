@@ -1,73 +1,66 @@
 --=====================================================================
---  NEXUS TRACKER  v1.0
---  CC:Tweaked + Advanced Peripherals  (NeoForge 1.21.1)
+--  NEXUS TRACKER  v2.1   -  black & orange pixel UI
+--  CC:Tweaked + Advanced Peripherals + CC: Graphics  (NeoForge 1.21.1)
 --
---  Needs (attached directly or via wired modems):
---    * Advanced Monitor  (6 wide x 3 tall  ->  121 x 38 chars @ scale 0.5)
---    * Chat Box          (Advanced Peripherals)
---    * Player Detector   (Advanced Peripherals)
---    * NBT Storage       (Advanced Peripherals)
---
---  Save as "startup.lua" (or run "nexus").  PIN is set in CONFIG below.
+--  Needs: Advanced Monitor (6x3), Chat Box, Player Detector, NBT Storage
+--  Run:   nexus        (or save as startup.lua)
+--  Debug: SYSTEM tab shows live diagnostics. Files written on the computer:
+--         nexus_debug.txt (detector methods + raw data), nexus_error.txt (errors)
 --=====================================================================
 
 local CONFIG = {
-  PIN          = "4212",
-  LOCK_AFTER   = 180,        -- seconds of inactivity before auto-lock
-  TEXT_SCALE   = 0.5,
-  POLL_EVERY   = 2,          -- seconds between position polls
-  SAMPLE_EVERY = 5,          -- seconds between heatmap samples (while moving)
-  SAVE_EVERY   = 20,         -- seconds between saves (only if something changed)
-  NBT_BUDGET   = 15000,      -- bytes written to NBT Storage (raise if you raise the AP config limit)
-  LOCAL_MIRROR = true,       -- also keep a full uncapped copy on the computer's disk
-  LOCAL_FILE   = "nexus_data.json",
-  MAX_CHAT     = 5000,       -- messages kept in the local copy
-  MAX_HEAT     = 20000,      -- heat samples kept per player in the local copy
+  PIN            = "421299", -- 6 digits
+  LOCK_AFTER     = 180,      -- seconds idle before auto-lock
+  TEXT_SCALE     = 0.5,      -- monitor text scale (sets pixel resolution)
+  GFX_MODE       = 2,        -- CC: Graphics mode (2 = 256 colours)
+  CUSTOM_PALETTE = true,     -- set false to use the default CC palette
+  TOUCH_MODE     = "auto",   -- "auto", "chars" or "pixel" (what monitor_touch reports)
+  HEAT_PX        = 2,        -- screen pixels per heatmap pixel
+  POLL_EVERY     = 2,        -- seconds between position polls
+  SAMPLE_EVERY   = 5,        -- seconds between heatmap samples (moving)
+  SAVE_EVERY     = 20,
+  NBT_BUDGET     = 15000,    -- bytes written to NBT Storage (auto-shrinks if refused)
+  LOCAL_MIRROR   = true,     -- full uncapped copy on the computer disk
+  LOCAL_FILE     = "nexus_data.json",
+  DEBUG_FILE     = "nexus_debug.txt",
+  ERROR_FILE     = "nexus_error.txt",
+  MAX_CHAT       = 5000,
+  MAX_HEAT       = 20000,
 }
 
 --------------------------------------------------------------------
 -- helpers
 --------------------------------------------------------------------
-local function now() return math.floor(os.epoch("utc") / 1000) end
-local function clamp(v, a, b) return math.max(a, math.min(b, v)) end
-local function trunc(s, n)
-  s = tostring(s)
-  if #s > n then return s:sub(1, math.max(0, n - 1)) .. "~" end
-  return s
-end
+local floor, max, min = math.floor, math.max, math.min
+local function now() return floor(os.epoch("utc") / 1000) end
+local function clamp(v, a, b) return max(a, min(b, v)) end
 local function sanitize(s) return (tostring(s):gsub("[^\32-\126]", "?")) end
 local function fmtDT(t) return os.date("%m/%d %H:%M", t) end
-local function fmtTime(t) return os.date("%H:%M:%S", t) end
+local function fmtClock(t) return os.date("%H:%M", t) end
 local function ago(t)
-  local d = math.max(0, now() - t)
+  local d = max(0, now() - t)
   if d < 60 then return d .. "s"
-  elseif d < 3600 then return math.floor(d / 60) .. "m"
-  elseif d < 86400 then return math.floor(d / 3600) .. "h"
-  else return math.floor(d / 86400) .. "d" end
+  elseif d < 3600 then return floor(d / 60) .. "m"
+  elseif d < 86400 then return floor(d / 3600) .. "h"
+  else return floor(d / 86400) .. "d" end
 end
 local function fmtDur(s)
-  s = math.floor(s)
+  s = floor(s)
   if s < 60 then return s .. "s" end
-  if s < 3600 then return math.floor(s / 60) .. "m " .. (s % 60) .. "s" end
-  return math.floor(s / 3600) .. "h " .. math.floor((s % 3600) / 60) .. "m"
+  if s < 3600 then return floor(s / 60) .. "m " .. (s % 60) .. "s" end
+  return floor(s / 3600) .. "h " .. floor((s % 3600) / 60) .. "m"
 end
 
-local function wrap(s, width)
-  local out, line = {}, ""
-  width = math.max(4, width)
-  for w0 in s:gmatch("%S+") do
-    local word = w0
-    while #word > width do
-      if line ~= "" then out[#out + 1] = line; line = "" end
-      out[#out + 1] = word:sub(1, width)
-      word = word:sub(width + 1)
-    end
-    if line == "" then line = word
-    elseif #line + 1 + #word <= width then line = line .. " " .. word
-    else out[#out + 1] = line; line = word end
-  end
-  if line ~= "" or #out == 0 then out[#out + 1] = line end
-  return out
+-- diagnostics (shown on the SYSTEM tab, nothing fails silently any more)
+local diag = { ok = 0, fail = 0, n = 0, how = "", err = "", lastErr = "", raw = "-",
+               chatN = 0, chatLast = 0, touch = "-", saveErr = "", nbtErr = "",
+               methods = "?", localBytes = 0 }
+local function logErr(s)
+  s = sanitize(s)
+  if diag.lastErr == s then return end
+  diag.lastErr = s
+  local f = fs.open("nexus_error.txt", "a")
+  if f then f.writeLine(os.date("%m/%d %H:%M:%S", now()) .. "  " .. s); f.close() end
 end
 
 --------------------------------------------------------------------
@@ -88,69 +81,323 @@ local nbt      = find("nbt_storage", "nbtStorage")
 if not mon then error("No monitor found!", 0) end
 if not mon.isColour() then error("Monitor must be an ADVANCED monitor!", 0) end
 if not detector then error("No Player Detector found!", 0) end
-if not nbt then print("WARNING: no NBT Storage found - saving to disk only.") end
-if not chatBox then print("WARNING: no Chat Box found - chat will not be logged.") end
+if not nbt then print("WARNING: no NBT Storage - saving to disk only.") end
+if not chatBox then print("WARNING: no Chat Box - chat will not be logged.") end
+if type(mon.setGraphicsMode) ~= "function" or type(mon.drawPixels) ~= "function" then
+  error("This monitor has no graphics API. Install CC: Graphics (0.2+ with monitor support).", 0)
+end
 local monName = peripheral.getName(mon)
+do
+  local ok, m = pcall(peripheral.getMethods, peripheral.getName(detector))
+  if ok and type(m) == "table" then diag.methods = table.concat(m, ", ") end
+end
 
 mon.setTextScale(CONFIG.TEXT_SCALE)
 local W, H = mon.getSize()
-if H < 30 then
-  error("Monitor too small (" .. W .. "x" .. H .. "). Use a 6x3 advanced monitor.", 0)
-end
-local win = window.create(mon, 1, 1, W, H, false)
+local okg, eg = pcall(mon.setGraphicsMode, CONFIG.GFX_MODE)
+if not okg then error("setGraphicsMode failed: " .. tostring(eg), 0) end
+local PXW, PXH = mon.getSize(true)
+if type(PXW) ~= "number" or PXW <= W then PXW, PXH = W * 6, H * 9 end
+if PXH < 250 then error("Monitor too small (" .. PXW .. "x" .. PXH .. " px). Use 6x3.", 0) end
 
 --------------------------------------------------------------------
--- colours / palette
+-- palette  (black + orange)
 --------------------------------------------------------------------
-local C = {
-  bg = colors.black, panel = colors.gray, panel2 = colors.brown,
-  dim = colors.lightGray, text = colors.white,
-  blue = colors.blue, cyan = colors.cyan, purple = colors.purple,
-  pink = colors.magenta, red = colors.red, orange = colors.orange,
-  yellow = colors.yellow, lime = colors.lime, green = colors.green,
-  sky = colors.lightBlue, rose = colors.pink,
+local ORDER = { "K0", "K1", "K2", "K3", "G1", "G2", "WH", "O1", "O2", "O3", "O4", "O5", "O6", "RD", "YL" }
+local RGB = {
+  K0 = 0x060606, K1 = 0x101010, K2 = 0x1b1b1b, K3 = 0x303030,
+  G1 = 0x7a7a7a, G2 = 0xb4b4b4, WH = 0xf4f0ea,
+  O1 = 0x3a1c06, O2 = 0x79380b, O3 = 0xc2560f, O4 = 0xff7a1a, O5 = 0xffa24f, O6 = 0xffd09a,
+  RD = 0xff4a3d, YL = 0xffd83a,
 }
-local PAL = {
-  [colors.black]     = 0x0b0e17, [colors.gray]      = 0x161b2b,
-  [colors.brown]     = 0x2a3250, [colors.lightGray] = 0x8a93ad,
-  [colors.white]     = 0xe8ecf7, [colors.blue]      = 0x4f8cff,
-  [colors.cyan]      = 0x22d3ee, [colors.purple]    = 0xa78bfa,
-  [colors.magenta]   = 0xf472b6, [colors.red]       = 0xf87171,
-  [colors.orange]    = 0xfb923c, [colors.yellow]    = 0xfacc15,
-  [colors.lime]      = 0xa3e635, [colors.green]     = 0x34d399,
-  [colors.lightBlue] = 0x7dd3fc, [colors.pink]      = 0xfda4af,
-}
-local function applyPalette(dev)
-  for c, v in pairs(PAL) do dev.setPaletteColor(c, v) end
-end
-local function restorePalette(dev)
-  for c = 0, 15 do
-    local col = 2 ^ c
-    pcall(function() dev.setPaletteColor(col, term.nativePaletteColor(col)) end)
+local FALLBACK = { K0 = 15, K1 = 15, K2 = 7, K3 = 7, G1 = 8, G2 = 8, WH = 0, O1 = 12, O2 = 12,
+                   O3 = 1, O4 = 1, O5 = 4, O6 = 4, RD = 14, YL = 4 }
+local COL, palOK = {}, CONFIG.CUSTOM_PALETTE
+if palOK then
+  for i, name in ipairs(ORDER) do
+    local idx = 16 + i                       -- 17..31 (avoids 32/64/128 collisions)
+    local ok = pcall(mon.setPaletteColor, idx, RGB[name])
+    if not ok then palOK = false; break end
+    COL[name] = idx
+  end
+  if palOK then
+    local ok, r = pcall(mon.getPaletteColor, COL.O4)
+    if ok and type(r) == "number" and math.abs(r - 1.0) > 0.03 then palOK = false end
   end
 end
-applyPalette(mon); applyPalette(win)
+if not palOK then for k, v in pairs(FALLBACK) do COL[k] = v end end
+local K0, K1, K2, K3, G1, G2, WH = COL.K0, COL.K1, COL.K2, COL.K3, COL.G1, COL.G2, COL.WH
+local O1, O2, O3, O4, O5, O6, RD, YL = COL.O1, COL.O2, COL.O3, COL.O4, COL.O5, COL.O6, COL.RD, COL.YL
+local HEATC = { O1, O2, O3, O4, O5, O6 }
 
-local HEAT = { C.blue, C.cyan, C.green, C.lime, C.yellow, C.orange, C.red }
-local RANK = {}
-for i, c in ipairs(HEAT) do RANK[c] = i end
-RANK[C.text] = 8; RANK[C.pink] = 9
+--------------------------------------------------------------------
+-- pixel backend
+--------------------------------------------------------------------
+local ROWSTR = pcall(mon.drawPixels, 0, 0, { string.char(K0) })
+local function put(x, y, rows)
+  if not ROWSTR then
+    for i = 1, #rows do
+      local s, t = rows[i], {}
+      for j = 1, #s do t[j] = s:byte(j) end
+      rows[i] = t
+    end
+  end
+  mon.drawPixels(x, y, rows)
+end
+local function freeze(b) pcall(mon.setFrozen, b) end
 
-local USER_COLS = { C.cyan, C.lime, C.orange, C.pink, C.sky, C.purple, C.green, C.rose }
-local function userColor(name)
-  local s = 0
-  for i = 1, #name do s = s + name:byte(i) * i end
-  return USER_COLS[(s % #USER_COLS) + 1]
+local function rect(x, y, w, h, c)
+  x, y, w, h = floor(x), floor(y), floor(w), floor(h)
+  if x < 0 then w = w + x; x = 0 end
+  if y < 0 then h = h + y; y = 0 end
+  if x + w > PXW then w = PXW - x end
+  if y + h > PXH then h = PXH - y end
+  if w <= 0 or h <= 0 then return end
+  local s = string.rep(string.char(c), w)
+  local rows = {}
+  for i = 1, h do rows[i] = s end
+  put(x, y, rows)
 end
 
-local UP, DOWN, PLAYR, REWR = string.char(30), string.char(31), string.char(16), string.char(17)
+--------------------------------------------------------------------
+-- custom bitmap font (5x7 caps, 9 row cell with descenders)
+--------------------------------------------------------------------
+local FONT_SRC = {
+  A = ".###./#...#/#...#/#####/#...#/#...#/#...#",
+  B = "####./#...#/#...#/####./#...#/#...#/####.",
+  C = ".###./#...#/#..../#..../#..../#...#/.###.",
+  D = "####./#...#/#...#/#...#/#...#/#...#/####.",
+  E = "#####/#..../#..../####./#..../#..../#####",
+  F = "#####/#..../#..../####./#..../#..../#....",
+  G = ".###./#...#/#..../#.###/#...#/#...#/.####",
+  H = "#...#/#...#/#...#/#####/#...#/#...#/#...#",
+  I = "###/.#./.#./.#./.#./.#./###",
+  J = "..###/....#/....#/....#/....#/#...#/.###.",
+  K = "#...#/#..#./#.#../##.../#.#../#..#./#...#",
+  L = "#..../#..../#..../#..../#..../#..../#####",
+  M = "#...#/##.##/#.#.#/#.#.#/#...#/#...#/#...#",
+  N = "#...#/##..#/#.#.#/#..##/#...#/#...#/#...#",
+  O = ".###./#...#/#...#/#...#/#...#/#...#/.###.",
+  P = "####./#...#/#...#/####./#..../#..../#....",
+  Q = ".###./#...#/#...#/#...#/#.#.#/#..#./.##.#",
+  R = "####./#...#/#...#/####./#.#../#..#./#...#",
+  S = ".####/#..../#..../.###./....#/....#/####.",
+  T = "#####/..#../..#../..#../..#../..#../..#..",
+  U = "#...#/#...#/#...#/#...#/#...#/#...#/.###.",
+  V = "#...#/#...#/#...#/#...#/#...#/.#.#./..#..",
+  W = "#...#/#...#/#...#/#.#.#/#.#.#/##.##/#...#",
+  X = "#...#/#...#/.#.#./..#../.#.#./#...#/#...#",
+  Y = "#...#/#...#/.#.#./..#../..#../..#../..#..",
+  Z = "#####/....#/...#./..#../.#.../#..../#####",
+  ["0"] = ".###./#...#/#..##/#.#.#/##..#/#...#/.###.",
+  ["1"] = "..#../.##../..#../..#../..#../..#../.###.",
+  ["2"] = ".###./#...#/....#/...#./..#../.#.../#####",
+  ["3"] = "####./....#/....#/.###./....#/....#/####.",
+  ["4"] = "...#./..##./.#.#./#..#./#####/...#./...#.",
+  ["5"] = "#####/#..../####./....#/....#/#...#/.###.",
+  ["6"] = ".###./#..../#..../####./#...#/#...#/.###.",
+  ["7"] = "#####/....#/...#./..#../.#.../.#.../.#...",
+  ["8"] = ".###./#...#/#...#/.###./#...#/#...#/.###.",
+  ["9"] = ".###./#...#/#...#/.####/....#/....#/.###.",
+  a = "2|.###./....#/.####/#...#/.####",
+  b = "#..../#..../####./#...#/#...#/#...#/####.",
+  c = "2|.###./#...#/#..../#...#/.###.",
+  d = "....#/....#/.####/#...#/#...#/#...#/.####",
+  e = "2|.###./#...#/#####/#..../.###.",
+  f = "..#./.#.#/.#../###./.#../.#../.#..",
+  g = "2|.####/#...#/#...#/#...#/.####/....#/.###.",
+  h = "#..../#..../####./#...#/#...#/#...#/#...#",
+  i = "#/./#/#/#/#/#",
+  j = "..#/.../..#/..#/..#/..#/..#/#.#/.#.",
+  k = "#..../#..../#..#./#.#../##.../#.#../#..#.",
+  l = "##./.#./.#./.#./.#./.#./.##",
+  m = "2|##.#./#.#.#/#.#.#/#.#.#/#.#.#",
+  n = "2|####./#...#/#...#/#...#/#...#",
+  o = "2|.###./#...#/#...#/#...#/.###.",
+  p = "2|####./#...#/#...#/#...#/####./#..../#....",
+  q = "2|.####/#...#/#...#/#...#/.####/....#/....#",
+  r = "2|#.##./##..#/#..../#..../#....",
+  s = "2|.####/#..../.###./....#/####.",
+  t = "1|.#../###./.#../.#../.#.#/..#.",
+  u = "2|#...#/#...#/#...#/#..##/.##.#",
+  v = "2|#...#/#...#/#...#/.#.#./..#..",
+  w = "2|#...#/#...#/#.#.#/#.#.#/.#.#.",
+  x = "2|#...#/.#.#./..#../.#.#./#...#",
+  y = "2|#...#/#...#/#...#/.####/....#/#...#/.###.",
+  z = "2|#####/...#./..#../.#.../#####",
+  ["."] = "6|#", [","] = "6|.#/#.", [":"] = "2|./#/./#/.", [";"] = "2|../.#/../.#/#.",
+  ["!"] = "#/#/#/#/#/./#",
+  ["?"] = ".###./#...#/....#/...#./..#../...../..#..",
+  ["-"] = "3|###", ["_"] = "8|#####", ["+"] = "2|..#../..#../#####/..#../..#..",
+  ["="] = "3|#####/...../#####",
+  ["/"] = "....#/....#/...#./..#../.#.../#..../#....",
+  ["\\"] = "#..../#..../.#.../..#../...#./....#/....#",
+  ["("] = "..#/.#./#../#../#../.#./..#", [")"] = "#../.#./..#/..#/..#/.#./#..",
+  ["["] = "##/#./#./#./#./#./##", ["]"] = "##/.#/.#/.#/.#/.#/##",
+  ["{"] = "..#/.#./.#./#../.#./.#./..#", ["}"] = "#../.#./.#./..#/.#./.#./#..",
+  ["<"] = "1|...#./..#../.#.../..#../...#.", [">"] = "1|.#.../..#../...#./..#../.#...",
+  ["@"] = ".###./#...#/#.###/#.#.#/#.###/#..../.####",
+  ["#"] = ".#.#./.#.#./#####/.#.#./#####/.#.#./.#.#.",
+  ["%"] = "##..#/##..#/...#./..#../.#.../#..##/#..##",
+  ["&"] = ".##../#..#./#.#../.#.../#.#.#/#..#./.##.#",
+  ["*"] = "1|#.#.#/.###./#####/.###./#.#.#",
+  ["'"] = "#/#", ['"'] = "#.#/#.#", ["`"] = "#./.#", ["~"] = "3|.#.#/#.#.",
+  ["|"] = "#/#/#/#/#/#/#", ["^"] = "..#../.#.#./#...#",
+}
+local FONTP = {}
+for ch, src in pairs(FONT_SRC) do
+  local t, body = 0, src
+  local pre, rest = src:match("^(%d+)|(.*)$")
+  if pre then t = tonumber(pre); body = rest end
+  local rows, w = {}, 0
+  for r in body:gmatch("[^/]+") do rows[#rows + 1] = r; if #r > w then w = #r end end
+  FONTP[ch] = { t = t, rows = rows, w = w }
+end
+FONTP[" "] = { t = 0, rows = {}, w = 3 }
+
+local gcache = {}
+local function glyph(ch, sc, fg, bg)
+  local key = ch .. sc .. ":" .. fg .. ":" .. bg
+  local g = gcache[key]
+  if g then return g end
+  local f = FONTP[ch] or FONTP["?"]
+  local fgc, bgc = string.char(fg), string.char(bg)
+  local rows = {}
+  for r = 0, 8 do
+    local pat = f.rows[r - f.t + 1]
+    local parts = {}
+    for c = 1, f.w do
+      parts[c] = string.rep((pat and pat:sub(c, c) == "#") and fgc or bgc, sc)
+    end
+    parts[#parts + 1] = string.rep(bgc, sc)
+    local line = table.concat(parts)
+    for _ = 1, sc do rows[#rows + 1] = line end
+  end
+  g = { rows = rows }
+  gcache[key] = g
+  return g
+end
+
+local function textW(s, sc)
+  sc = sc or 1
+  local w = 0
+  for i = 1, #s do
+    local f = FONTP[s:sub(i, i)] or FONTP["?"]
+    w = w + (f.w + 1) * sc
+  end
+  return w
+end
+
+local function fit(s, maxw, sc)
+  s = tostring(s)
+  if textW(s, sc) <= maxw then return s end
+  while #s > 1 and textW(s .. "..", sc) > maxw do s = s:sub(1, -2) end
+  return s .. ".."
+end
+
+local function text(x, y, s, fg, bg, sc)
+  sc = sc or 1
+  s = tostring(s)
+  if s == "" then return end
+  local n = 9 * sc
+  local cols = {}
+  for r = 1, n do cols[r] = {} end
+  for i = 1, #s do
+    local g = glyph(s:sub(i, i), sc, fg, bg)
+    for r = 1, n do local rr = cols[r]; rr[#rr + 1] = g.rows[r] end
+  end
+  local rows = {}
+  for r = 1, n do rows[r] = table.concat(cols[r]) end
+  x, y = floor(x), floor(y)
+  local w = #rows[1]
+  if x < 0 or y < 0 or x + w > PXW or y + n > PXH then
+    -- clip
+    local cx = max(0, x)
+    local cut = cx - x
+    local keep = min(w - cut, PXW - cx)
+    if keep <= 0 or y >= PXH then return end
+    local ry0 = max(0, -y)
+    local nr = {}
+    for r = 1 + ry0, n do
+      if y + r - 1 < PXH then nr[#nr + 1] = rows[r]:sub(cut + 1, cut + keep) end
+    end
+    if #nr == 0 then return end
+    put(cx, max(0, y), nr)
+    return
+  end
+  put(x, y, rows)
+end
+local function ctext(x, w, y, s, fg, bg, sc) text(x + floor((w - textW(s, sc)) / 2), y, s, fg, bg, sc) end
+local function rtext(xr, y, s, fg, bg, sc) text(xr - textW(s, sc), y, s, fg, bg, sc) end
+
+local function wrapPx(s, maxw)
+  local out, line = {}, ""
+  for w0 in s:gmatch("%S+") do
+    local word = w0
+    while textW(word, 1) > maxw do
+      if line ~= "" then out[#out + 1] = line; line = "" end
+      local cut = #word
+      while cut > 1 and textW(word:sub(1, cut), 1) > maxw do cut = cut - 1 end
+      out[#out + 1] = word:sub(1, cut)
+      word = word:sub(cut + 1)
+    end
+    if line == "" then line = word
+    elseif textW(line .. " " .. word, 1) <= maxw then line = line .. " " .. word
+    else out[#out + 1] = line; line = word end
+  end
+  if line ~= "" or #out == 0 then out[#out + 1] = line end
+  return out
+end
+
+-- icons -------------------------------------------------------------
+local TRI_L = "....#/...##/..###/.####/#####/.####/..###/...##/....#"
+local TRI_R = "#..../##.../###../####./#####/####./###../##.../#...."
+local function combine(a, b, gap)
+  local ra, rb, out = {}, {}, {}
+  for r in a:gmatch("[^/]+") do ra[#ra + 1] = r end
+  for r in b:gmatch("[^/]+") do rb[#rb + 1] = r end
+  for i = 1, #ra do out[i] = ra[i] .. string.rep(".", gap) .. rb[i] end
+  return table.concat(out, "/")
+end
+local ICON = {
+  play = TRI_R, left = TRI_L,
+  pause = "##.##/##.##/##.##/##.##/##.##/##.##/##.##/##.##/##.##",
+  rew = combine(TRI_L, TRI_L, 1), ff = combine(TRI_R, TRI_R, 1),
+  start = combine("#/#/#/#/#/#/#/#/#", TRI_L, 1), finish = combine(TRI_R, "#/#/#/#/#/#/#/#/#", 1),
+  x = "#...#/.#.#./..#../.#.#./#...#",
+  filter = "#########/.#######./..#####../...###.../....#..../....#....",
+  lock = ".###./#...#/#...#/#####/##.##/##.##/#####",
+  menu = "#######/......./#######/......./#######",
+  up = "...#.../..###../.#####./#######", down = "#######/.#####./..###../...#...",
+}
+local function icon(x, y, name, fg, bg, sc)
+  sc = sc or 1
+  local rows, w = {}, 0
+  for r in ICON[name]:gmatch("[^/]+") do rows[#rows + 1] = r; w = max(w, #r) end
+  local fgc, bgc = string.char(fg), string.char(bg)
+  local out = {}
+  for _, r in ipairs(rows) do
+    local parts = {}
+    for c = 1, w do parts[c] = string.rep(r:sub(c, c) == "#" and fgc or bgc, sc) end
+    local line = table.concat(parts)
+    for _ = 1, sc do out[#out + 1] = line end
+  end
+  put(floor(x), floor(y), out)
+  return w * sc, #rows * sc
+end
+local function iconSize(name, sc)
+  local w, h = 0, 0
+  for r in ICON[name]:gmatch("[^/]+") do w = max(w, #r); h = h + 1 end
+  return w * (sc or 1), h * (sc or 1)
+end
 
 --------------------------------------------------------------------
 -- data model + persistence
 --------------------------------------------------------------------
 local data = { v = 1, players = {}, chat = {}, heat = {}, dims = {}, saved = 0 }
 local dirty, chatVer, startup = false, 0, true
-local lastSave, lastSaveBytes, nbtOK = 0, 0, true
+local lastSave, lastTry, lastSaveBytes, nbtOK = 0, 0, 0, true
+local nbtBudget = CONFIG.NBT_BUDGET
 
 local function dimId(name)
   name = name or "minecraft:overworld"
@@ -166,47 +413,57 @@ local function dimShort(i)
   local s = n:gsub("^.-:", ""):gsub("_", " ")
   return (s:gsub("^%l", string.upper))
 end
-local function dimColor(i)
-  local n = data.dims[i] or ""
-  if n:find("overworld") then return C.green end
-  if n:find("nether") then return C.red end
-  if n:find("the_end") then return C.purple end
-  return C.cyan
-end
 
 local function payload(f)
   local out = { v = 1, saved = data.saved, dims = data.dims, players = data.players, chat = {}, heat = {} }
   local nc = #data.chat
-  for i = nc - math.floor(nc * f) + 1, nc do out.chat[#out.chat + 1] = data.chat[i] end
+  for i = nc - floor(nc * f) + 1, nc do out.chat[#out.chat + 1] = data.chat[i] end
   for name, s in pairs(data.heat) do
     local ns, arr = #s, {}
-    for i = ns - math.floor(ns * f) + 1, ns do arr[#arr + 1] = s[i] end
+    for i = ns - floor(ns * f) + 1, ns do arr[#arr + 1] = s[i] end
     out.heat[name] = arr
   end
   return out
 end
 
-local function saveNow()
+local function saveInner()
   data.saved = now()
+  diag.saveErr = ""
   if CONFIG.LOCAL_MIRROR then
+    local js = textutils.serialiseJSON(data)
     local f = fs.open(CONFIG.LOCAL_FILE, "w")
-    if f then f.write(textutils.serialiseJSON(data)); f.close() end
+    if f then f.write(js); f.close(); diag.localBytes = #js
+    else diag.saveErr = "cannot write " .. CONFIG.LOCAL_FILE end
   end
   if nbt then
-    local f, pj = 1.0, nil
-    while true do
-      pj = textutils.serialiseJSON(payload(f))
-      if #pj <= CONFIG.NBT_BUDGET or f < 0.02 then break end
-      f = f * 0.8
+    for _ = 1, 8 do
+      local f, pj = 1.0, nil
+      while true do
+        pj = textutils.serialiseJSON(payload(f))
+        if #pj <= nbtBudget or f < 0.02 then break end
+        f = f * 0.8
+      end
+      local t, n = {}, 0
+      for i = 1, #pj, 30000 do n = n + 1; t["c" .. n] = pj:sub(i, i + 29999) end
+      t.n = n
+      local ok, res = pcall(nbt.writeTable, t)
+      if ok and res ~= false then
+        nbtOK = true; diag.nbtErr = ""; lastSaveBytes = #pj
+        break
+      end
+      -- the NBT Storage refused it (too big?) - shrink the budget and retry
+      nbtOK = false
+      diag.nbtErr = ok and "write refused (too big?)" or tostring(res)
+      nbtBudget = max(1000, floor(nbtBudget * 0.7))
     end
-    local t, n = {}, 0
-    for i = 1, #pj, 30000 do n = n + 1; t["c" .. n] = pj:sub(i, i + 29999) end
-    t.n = n
-    nbtOK = pcall(nbt.writeTable, t)
-    lastSaveBytes = #pj
   end
   dirty = false
   lastSave = now()
+end
+local function saveNow()
+  lastTry = now()
+  local ok, err = pcall(saveInner)
+  if not ok then diag.saveErr = tostring(err); logErr("save: " .. tostring(err)) end
 end
 
 local function decode(json)
@@ -253,8 +510,9 @@ end
 local function ensurePlayer(name)
   local p = data.players[name]
   if not p then
-    p = { online = false, first = now(), seen = now(), x = 0, y = 0, z = 0, dim = dimId() }
+    p = { online = false, first = now(), seen = now(), x = 0, y = 0, z = 0, dim = dimId(), pos = false }
     data.players[name] = p
+    dirty = true
   end
   return p
 end
@@ -271,7 +529,7 @@ end
 local function setOffline(name)
   local p = data.players[name]
   if p and p.online then
-    p.online = false; p.seen = now()
+    p.online = false; p.seen = now(); p.stale = nil
     logEvent("l", name, name .. " left the game")
   end
 end
@@ -288,8 +546,7 @@ local function addSample(name, p, force)
   end
   s[#s + 1] = { t, p.x, p.z, p.dim }
   if #s > CONFIG.MAX_HEAT then
-    local ns = {}
-    local half = math.floor(#s / 2)
+    local ns, half = {}, floor(#s / 2)
     for i = 1, half, 2 do ns[#ns + 1] = s[i] end
     for i = half + 1, #s do ns[#ns + 1] = s[i] end
     data.heat[name] = ns
@@ -297,22 +554,104 @@ local function addSample(name, p, force)
   dirty = true
 end
 
-local function poll()
-  local ok, list = pcall(detector.getOnlinePlayers)
-  if not ok or type(list) ~= "table" then return end
-  local set = {}
-  for _, name in ipairs(list) do
-    set[name] = true
-    setOnline(name)
-    local ok2, pos = pcall(detector.getPlayerPos, name)
-    if ok2 and type(pos) == "table" and pos.x then
-      local p = data.players[name]
-      p.x, p.y, p.z = math.floor(pos.x), math.floor(pos.y or 0), math.floor(pos.z)
-      if pos.dimension then p.dim = dimId(pos.dimension) end
-      p.seen = now()
-      addSample(name, p)
+-- position reading with diagnostics --------------------------------
+local function rawStr(v)
+  if v == nil then return "nil" end
+  local ok, s = pcall(textutils.serialise, v, { compact = true })
+  if not ok then s = tostring(v) end
+  return sanitize(s):sub(1, 400)
+end
+
+local function readPos(name)
+  local lastRaw
+  for _, fname in ipairs({ "getPlayerPos", "getPlayer" }) do
+    local fn = detector[fname]
+    if type(fn) == "function" then
+      local ok, res = pcall(fn, name)
+      if ok and type(res) == "table" then
+        local x, y, z = res.x or res.X or res.posX, res.y or res.Y or res.posY, res.z or res.Z or res.posZ
+        if not x and type(res.pos) == "table" then x, y, z = res.pos.x, res.pos.y, res.pos.z end
+        if not x and type(res.position) == "table" then x, y, z = res.position.x, res.position.y, res.position.z end
+        x, z = tonumber(x), tonumber(z)
+        if x and z then
+          return { x = x, y = tonumber(y) or 0, z = z, dimension = res.dimension or res.dim }, fname, res
+        end
+        lastRaw = res
+      elseif not ok then
+        diag.err = fname .. ": " .. tostring(res)
+        lastRaw = tostring(res)
+      else
+        lastRaw = res
+      end
     end
   end
+  return nil, nil, lastRaw
+end
+
+local function writeDebug(name)
+  local f = fs.open(CONFIG.DEBUG_FILE, "w")
+  if not f then return end
+  f.writeLine("NEXUS debug  " .. os.date("%Y-%m-%d %H:%M:%S", now()))
+  f.writeLine("pixel size: " .. PXW .. "x" .. PXH .. "  chars: " .. W .. "x" .. H)
+  f.writeLine("custom palette: " .. tostring(palOK) .. "   string rows: " .. tostring(ROWSTR))
+  f.writeLine("detector methods: " .. diag.methods)
+  f.writeLine("chat box: " .. tostring(chatBox ~= nil) .. "  nbt storage: " .. tostring(nbt ~= nil))
+  f.writeLine("last touch: " .. diag.touch)
+  if name then
+    local pos, how, raw = readPos(name)
+    f.writeLine("sample player: " .. name)
+    f.writeLine("method used: " .. tostring(how))
+    f.writeLine("raw result: " .. rawStr(pos or raw))
+  end
+  f.writeLine("last detector error: " .. diag.err)
+  f.writeLine("last error: " .. diag.lastErr)
+  f.close()
+end
+
+local debugDone = false
+
+local function listPlayers()
+  local ok, list = pcall(detector.getOnlinePlayers)
+  if not ok then diag.err = "getOnlinePlayers: " .. tostring(list); return nil end
+  if type(list) ~= "table" then diag.err = "getOnlinePlayers returned " .. type(list); return nil end
+  local out = {}
+  for _, v in pairs(list) do
+    if type(v) == "string" then out[#out + 1] = v
+    elseif type(v) == "table" then
+      local n = v.name or v.username or v.player
+      if n then out[#out + 1] = tostring(n) end
+    end
+  end
+  table.sort(out)
+  return out
+end
+
+local function poll()
+  local names = listPlayers()
+  if not names then diag.n = 0; diag.ok, diag.fail = 0, 0; return end
+  diag.err = ""
+  diag.n = #names
+  local set, okc, failc = {}, 0, 0
+  for i, name in ipairs(names) do
+    set[name] = true
+    setOnline(name)
+    local p = data.players[name]
+    local pos, how, raw = readPos(name)
+    if i == 1 then diag.raw = name .. " = " .. rawStr(pos and raw or raw) end
+    if pos then
+      okc = okc + 1
+      p.x, p.y, p.z = floor(pos.x), floor(pos.y), floor(pos.z)
+      if pos.dimension then p.dim = dimId(pos.dimension) end
+      p.pos = true; p.stale = nil; p.seen = now()
+      diag.how = how
+      addSample(name, p)
+    else
+      failc = failc + 1
+      p.stale = true
+    end
+    if not debugDone then debugDone = true; writeDebug(name) end
+  end
+  diag.ok, diag.fail = okc, failc
   for name, p in pairs(data.players) do
     if p.online and not set[name] then setOffline(name) end
   end
@@ -323,7 +662,7 @@ end
 -- UI state
 --------------------------------------------------------------------
 local ui  = { tab = "tracking", locked = true, pin = "", msg = "", lastAct = now(),
-              modal = nil, wrong = 0, lockUntil = 0 }
+              modal = nil, drawer = nil, wrong = 0, lockUntil = 0 }
 local trk = { sel = nil, scroll = 0 }
 local DAYS  = { "Any", "Today", "Yesterday", "Last 7 days", "Last 30 days", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" }
 local WD    = { Mon = 2, Tue = 3, Wed = 4, Thu = 5, Fri = 6, Sat = 7, Sun = 1 }
@@ -334,53 +673,63 @@ local cs  = { users = {}, day = 1, time = 1, len = 1, events = true, q = "", scr
               sel = {}, fv = 0, filtered = {}, lines = {}, key = "" }
 local hm  = { player = nil, tp = nil, follow = true, playing = false, rate = 1, dim = nil, last = nil }
 
-local hits = {}
+local hits, SB = {}, {}
+local function addHit(id, x, y, w, h, d) hits[#hits + 1] = { id = id, x = x, y = y, w = w, h = h, data = d } end
+
+-- layout
+local M, HDR, FTR = 12, 34, 18
+local CY0, CY1 = HDR + 6, PXH - FTR - 6
 
 --------------------------------------------------------------------
--- drawing primitives
+-- widgets
 --------------------------------------------------------------------
-local function fill(x, y, w, h, bg)
-  if w <= 0 or h <= 0 then return end
-  local s = string.rep(" ", w)
-  win.setBackgroundColor(bg)
-  for j = y, y + h - 1 do win.setCursorPos(x, j); win.write(s) end
+-- style: solid | outline | danger | dangero | ghost
+local function btn(id, x, y, w, h, label, style, d, bgc, sc)
+  style = style or "outline"; bgc = bgc or K1; sc = sc or 1
+  local fg
+  if style == "solid" then rect(x, y, w, h, O4); fg = K0
+  elseif style == "danger" then rect(x, y, w, h, RD); fg = K0
+  elseif style == "dangero" then rect(x, y, w, h, RD); rect(x + 1, y + 1, w - 2, h - 2, bgc); fg = RD
+  elseif style == "ghost" then rect(x, y, w, h, bgc); fg = O5
+  else rect(x, y, w, h, O3); rect(x + 1, y + 1, w - 2, h - 2, bgc); fg = O5 end
+  local bg = (style == "solid" and O4) or (style == "danger" and RD) or bgc
+  label = fit(label, w - 6, sc)
+  text(x + floor((w - textW(label, sc)) / 2), y + floor((h - 7 * sc) / 2), label, fg, bg, sc)
+  addHit(id, x, y, w, h, d)
 end
-local function text(x, y, s, fg, bg)
-  win.setCursorPos(x, y)
-  win.setBackgroundColor(bg or C.bg)
-  win.setTextColor(fg or C.text)
-  win.write(s)
+
+local function iconBtn(id, x, y, w, h, name, fg, bg, d, sc)
+  rect(x, y, w, h, bg)
+  local iw, ih = iconSize(name, sc or 1)
+  icon(x + floor((w - iw) / 2), y + floor((h - ih) / 2), name, fg, bg, sc or 1)
+  addHit(id, x, y, w, h, d)
 end
-local function ctext(x, w, y, s, fg, bg)
-  text(x + math.floor((w - #s) / 2), y, s, fg, bg)
+
+local function scrollbar(id, x, y, h, total, vis, pos)
+  rect(x, y, 5, h, K2)
+  local th, ty = h, y
+  if total > vis then
+    th = max(14, floor(h * vis / total))
+    ty = y + floor((h - th) * clamp(pos, 0, total - vis) / (total - vis))
+  end
+  rect(x, ty, 5, th, O3)
+  SB[id] = { y = y, h = h, ty = ty, th = th }
+  addHit(id, x - 16, y, 38, h)
 end
-local function button(id, x, y, w, h, label, bg, fg, d)
-  fill(x, y, w, h, bg)
-  label = trunc(label, w - 1)
-  text(x + math.floor((w - #label) / 2), y + math.floor((h - 1) / 2), label, fg or C.text, bg)
-  hits[#hits + 1] = { x = x, y = y, w = w, h = h, id = id, data = d }
-end
-local function panel(x, y, w, h, title, accent)
-  fill(x, y, w, h, C.panel)
-  fill(x, y, 1, h, accent)
-  if title then text(x + 2, y, title, accent, C.panel) end
-end
-local function dot(x, y, col) fill(x, y, 1, 1, col) end
-local function gradientBar(y)
-  local cols = { C.blue, C.cyan, C.green, C.lime, C.yellow, C.orange, C.pink, C.purple }
-  local seg = math.ceil(W / #cols)
-  for i, c in ipairs(cols) do fill((i - 1) * seg + 1, y, seg, 1, c) end
-end
-local function coordLine(x, y, p, bg)
-  text(x, y, "X", C.orange, bg);       text(x + 2, y, tostring(p.x), C.text, bg)
-  local o = 2 + #tostring(p.x) + 2
-  text(x + o, y, "Y", C.lime, bg);     text(x + o + 2, y, tostring(p.y), C.text, bg)
-  o = o + 2 + #tostring(p.y) + 2
-  text(x + o, y, "Z", C.cyan, bg);     text(x + o + 2, y, tostring(p.z), C.text, bg)
+
+local function activeFilterCount()
+  local n = 0
+  if next(cs.users) then n = n + 1 end
+  if cs.day > 1 then n = n + 1 end
+  if cs.time > 1 then n = n + 1 end
+  if cs.len > 1 then n = n + 1 end
+  if not cs.events then n = n + 1 end
+  if cs.q ~= "" then n = n + 1 end
+  return n
 end
 
 --------------------------------------------------------------------
--- actions (delete etc.)
+-- actions
 --------------------------------------------------------------------
 local function confirm(msg, onYes) ui.modal = { type = "confirm", msg = msg, yes = onYes } end
 
@@ -437,8 +786,8 @@ local function matchChat(e, n, mid)
   return true
 end
 
-local function buildChat(listW)
-  local key = chatVer .. ":" .. cs.fv .. ":" .. listW
+local function buildChat(maxw)
+  local key = chatVer .. ":" .. cs.fv .. ":" .. maxw
   if cs.key == key then return end
   cs.key = key
   local n = now()
@@ -447,59 +796,53 @@ local function buildChat(listW)
   local flt = {}
   for _, e in ipairs(data.chat) do if matchChat(e, n, mid) then flt[#flt + 1] = e end end
   cs.filtered = flt
-  local lines, width = {}, listW - 17
+  local lines = {}
   for _, e in ipairs(flt) do
     local content, nl, col
-    if e[2] == "c" then content = "<" .. e[3] .. "> " .. e[4]; nl = #e[3] + 2; col = C.text
-    else content = e[4]; nl = 0; col = C.yellow end
-    for i, s in ipairs(wrap(content, width)) do
+    if e[2] == "c" then content = "<" .. e[3] .. "> " .. e[4]; nl = #e[3] + 2; col = WH
+    else content = e[4]; nl = 0; col = YL end
+    for i, s in ipairs(wrapPx(content, maxw)) do
       lines[#lines + 1] = { e = e, s = s, first = (i == 1), nl = nl, col = col }
     end
   end
   cs.lines = lines
 end
-
 local function bumpFilter() cs.fv = cs.fv + 1; cs.scroll = 0 end
 
 --------------------------------------------------------------------
 -- LOCK SCREEN
 --------------------------------------------------------------------
 local function drawLock()
-  fill(1, 1, W, H, C.bg)
-  gradientBar(1); gradientBar(H)
-  local kh = (H >= 30) and 3 or 1
-  local pw = 40
-  local ph = 10 + 4 * (kh + 1) + 1
-  local px, py = math.floor((W - pw) / 2) + 1, math.floor((H - ph) / 2) + 1
-  fill(px - 1, py - 1, pw + 2, ph + 2, C.panel2)
-  fill(px, py, pw, ph, C.panel)
-  fill(px, py, pw, 1, C.purple)
-  ctext(px, pw, py + 2, "N E X U S   T R A C K E R", C.cyan, C.panel)
-  ctext(px, pw, py + 3, "secure access terminal", C.dim, C.panel)
-
-  -- pin dots
-  local dx = px + math.floor((pw - 4 * 4 + 2) / 2)
-  for i = 1, 4 do
-    local filled = i <= #ui.pin
-    fill(dx + (i - 1) * 4, py + 5, 2, 1, filled and C.cyan or C.panel2)
+  rect(0, 0, PXW, PXH, K0)
+  rect(0, 0, PXW, 2, O4)
+  local cx = floor(PXW / 2)
+  ctext(0, PXW, 22, "NEXUS", O4, K0, 3)
+  ctext(0, PXW, 54, "SECURE ACCESS TERMINAL", G1, K0, 1)
+  local np = #CONFIG.PIN
+  local step = 24
+  local startX = cx - floor((np * step - 10) / 2)
+  for i = 1, np do
+    local dx = startX + (i - 1) * step
+    rect(dx, 76, 14, 14, i <= #ui.pin and O4 or K3)
+    if i > #ui.pin then rect(dx + 1, 77, 12, 12, K0) end
   end
   local left = ui.lockUntil - now()
-  if left > 0 then
-    ctext(px, pw, py + 7, "Too many attempts - wait " .. left .. "s", C.red, C.panel)
-  else
-    ctext(px, pw, py + 7, ui.msg ~= "" and ui.msg or "Enter 4-digit PIN", ui.msg ~= "" and C.red or C.dim, C.panel)
-  end
+  if left > 0 then ctext(0, PXW, 98, "TOO MANY ATTEMPTS - WAIT " .. left .. "S", RD, K0, 1)
+  elseif ui.msg ~= "" then ctext(0, PXW, 98, ui.msg, RD, K0, 1)
+  else ctext(0, PXW, 98, "ENTER PIN", G1, K0, 1) end
 
-  local keys = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "C", "0", "<" }
-  local kw = 8
-  local kx0 = px + math.floor((pw - (3 * kw + 2)) / 2)
-  for i, k in ipairs(keys) do
-    local r, c = math.floor((i - 1) / 3), (i - 1) % 3
-    local bg, fg = C.panel2, C.text
-    if k == "C" then bg, fg = C.red, C.bg elseif k == "<" then bg, fg = C.orange, C.bg end
-    button("pin", kx0 + c * (kw + 1), py + 9 + r * (kh + 1), kw, kh, k, bg, fg, k)
+  local y0 = 116
+  local kh = min(38, floor((PXH - y0 - 22) / 4) - 8)
+  local kw, gap = 66, 8
+  local x0 = cx - floor((3 * kw + 2 * gap) / 2)
+  local keysL = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "CLR", "0", "DEL" }
+  for i, k in ipairs(keysL) do
+    local r, c = floor((i - 1) / 3), (i - 1) % 3
+    local style = (k == "CLR" or k == "DEL") and "ghost" or "outline"
+    btn("pin", x0 + c * (kw + gap), y0 + r * (kh + gap), kw, kh, k, style, k, K0, (#k == 1) and 2 or 1)
   end
-  ctext(px, pw, py + ph - 1, fmtTime(now()), C.dim, C.panel)
+  ctext(0, PXW, PXH - 14, fmtClock(now()), K3, K0, 1)
+  rect(0, PXH - 2, PXW, 2, O4)
 end
 
 --------------------------------------------------------------------
@@ -517,80 +860,104 @@ local function sortedPlayers()
   return arr
 end
 
-local function drawTracking(x, y, w, h)
-  local listW = math.floor(w * 0.64)
-  panel(x, y, listW, h, "PLAYER TRACKER", C.blue)
+local function coordText(x, y, p, bg, dim)
+  local cx = x
+  local vals = { { "X", p.x }, { "Y", p.y }, { "Z", p.z } }
+  for _, v in ipairs(vals) do
+    text(cx, y, v[1], dim and O3 or O4, bg, 1); cx = cx + textW(v[1], 1) + 3
+    local s = tostring(v[2])
+    text(cx, y, s, dim and G1 or WH, bg, 1); cx = cx + textW(s, 1) + 12
+  end
+end
+
+local function drawTracking()
+  local selName = trk.sel
+  local selP = selName and data.players[selName]
+  if selName and not selP then trk.sel = nil; selName = nil end
+  local detW = selP and 290 or 0
+  local rb = PXW - M - detW - (selP and 10 or 0)
+  local lx = M
+  local lw = rb - lx - 14
+
   local names = sortedPlayers()
-  local onl = 0
-  for _, n in ipairs(names) do if data.players[n].online then onl = onl + 1 end end
-  local info = onl .. " online / " .. #names .. " known"
-  text(x + listW - #info - 2, y, info, C.dim, C.panel)
+  local cName, cCoord, cDim, cStat = lx + 22, lx + floor(lw * 0.27), lx + floor(lw * 0.64), lx + floor(lw * 0.82)
+  text(cName, CY0, "PLAYER", G1, K0)
+  text(cCoord, CY0, "COORDINATES", G1, K0)
+  text(cDim, CY0, "DIMENSION", G1, K0)
+  text(cStat, CY0, "STATUS", G1, K0)
+  rect(lx, CY0 + 12, lw, 1, K3)
 
-  local nameX, coordX, dimX = x + 5, x + 24, x + 50
-  text(nameX, y + 1, "PLAYER", C.dim, C.panel)
-  text(coordX, y + 1, "COORDINATES", C.dim, C.panel)
-  text(dimX, y + 1, "DIMENSION", C.dim, C.panel)
-
-  local rowsVis = math.floor((h - 2 - 3) / 2)
-  local maxScroll = math.max(0, #names - rowsVis)
+  local rowH = 30
+  local top = CY0 + 16
+  local rowsVis = floor((CY1 - top) / rowH)
+  local maxScroll = max(0, #names - rowsVis)
   trk.scroll = clamp(trk.scroll, 0, maxScroll)
+  rect(lx, top, lw, CY1 - top, K0)
   for i = 1, rowsVis do
     local name = names[trk.scroll + i]
     if not name then break end
     local p = data.players[name]
-    local ry = y + 2 + (i - 1) * 2
-    local sel = (trk.sel == name)
-    local bg = sel and C.panel2 or C.panel
-    fill(x + 1, ry, listW - 1, 2, bg)
-    if sel then fill(x + 1, ry, 1, 2, C.cyan) end
-    dot(x + 3, ry, p.online and C.green or C.red)
-    text(nameX, ry, trunc(name, 17), userColor(name), bg)
-    text(nameX, ry + 1, p.online and "online now" or ("offline " .. ago(p.seen) .. " ago"), C.dim, bg)
-    coordLine(coordX, ry, p, bg)
-    text(coordX, ry + 1, p.online and "live position" or ("last seen " .. fmtDT(p.seen)), C.dim, bg)
-    local dn = " " .. dimShort(p.dim) .. " "
-    text(dimX, ry, dn, C.bg, dimColor(p.dim))
-    hits[#hits + 1] = { x = x + 1, y = ry, w = listW - 1, h = 2, id = "trkrow", data = name }
+    local ry = top + (i - 1) * rowH
+    local sel = (name == selName)
+    local bg = sel and K2 or ((i % 2 == 0) and K1 or K0)
+    rect(lx, ry, lw, rowH - 2, bg)
+    if sel then rect(lx, ry, 3, rowH - 2, O4) end
+    rect(lx + 10, ry + 10, 6, 6, p.online and O4 or K3)
+    text(cName, ry + 4, fit(name, cCoord - cName - 8, 1), WH, bg, 1)
+    local sub, subc = "", G1
+    if p.online then sub = p.stale and "position lost" or "online now"; subc = p.stale and RD or O3
+    else sub = "offline " .. ago(p.seen) .. " ago" end
+    text(cName, ry + 15, sub, subc, bg, 1)
+    if p.pos then
+      coordText(cCoord, ry + 4, p, bg, (not p.online) or p.stale)
+      text(cCoord, ry + 15, p.online and (p.stale and "last known" or "live") or ("last seen " .. fmtDT(p.seen)), G1, bg, 1)
+    else
+      text(cCoord, ry + 4, "NO SIGNAL", G1, bg, 1)
+      text(cCoord, ry + 15, "see SYSTEM tab", K3, bg, 1)
+    end
+    text(cDim, ry + 4, p.pos and dimShort(p.dim) or "-", p.pos and O5 or G1, bg, 1)
+    text(cStat, ry + 4, p.online and "ONLINE" or "OFFLINE", p.online and O4 or G1, bg, 1)
+    text(cStat, ry + 15, "since " .. fmtDT(p.first), G1, bg, 1)
+    addHit("trkrow", lx, ry, lw, rowH - 2, name)
   end
-  if #names == 0 then ctext(x, listW, y + 6, "No players recorded yet", C.dim, C.panel) end
+  if #names == 0 then
+    ctext(lx, lw, top + 50, "NO PLAYERS RECORDED YET", G1, K0, 1)
+    ctext(lx, lw, top + 66, diag.err ~= "" and fit("DETECTOR: " .. diag.err, lw - 20, 1) or "open the SYSTEM tab to check the detector", diag.err ~= "" and RD or K3, K0, 1)
+  end
+  scrollbar("trkscroll", rb - 6, top, CY1 - top, #names, rowsVis, trk.scroll)
 
-  -- scroll buttons
-  local by = y + h - 3
-  button("trkup", x + 2, by, 7, 3, UP, C.panel2, C.cyan)
-  button("trkdn", x + 10, by, 7, 3, DOWN, C.panel2, C.cyan)
-  local pg = "page " .. (math.floor(trk.scroll / math.max(1, rowsVis)) + 1) .. "/" .. math.max(1, math.ceil(#names / math.max(1, rowsVis)))
-  text(x + 19, by + 1, pg, C.dim, C.panel)
-
-  -- detail panel
-  local dx, dw = x + listW + 1, w - listW - 1
-  panel(dx, y, dw, h, "DETAILS", C.cyan)
-  local p = trk.sel and data.players[trk.sel]
-  if not p then
-    ctext(dx, dw, y + math.floor(h / 2), "Select a player", C.dim, C.panel)
-    return
+  if selP then
+    local dx = PXW - M - detW
+    local dy, dh = CY0, CY1 - CY0
+    rect(dx, dy, detW, dh, K1)
+    rect(dx, dy, detW, 2, O4)
+    rect(dx, dy, 1, dh, K3)
+    iconBtn("detclose", dx + detW - 30, dy + 6, 24, 20, "x", O5, K1)
+    text(dx + 14, dy + 12, fit(selName, detW - 56, 2), WH, K1, 2)
+    rect(dx + 14, dy + 34, 40, 2, O4)
+    rect(dx + 14, dy + 46, 6, 6, selP.online and O4 or K3)
+    text(dx + 26, dy + 45, selP.online and "ONLINE" or ("OFFLINE  " .. ago(selP.seen) .. " ago"), selP.online and O4 or G1, K1)
+    text(dx + 14, dy + 64, "POSITION" .. (selP.stale and "  (last known)" or ""), G1, K1)
+    if selP.pos then
+      local axes = { { "X", selP.x }, { "Y", selP.y }, { "Z", selP.z } }
+      for k, a in ipairs(axes) do
+        local ay = dy + 78 + (k - 1) * 22
+        text(dx + 14, ay + 4, a[1], O4, K1)
+        text(dx + 34, ay, tostring(a[2]), selP.stale and G1 or WH, K1, 2)
+      end
+      text(dx + 14, dy + 148, "DIMENSION", G1, K1)
+      text(dx + 14, dy + 160, dimShort(selP.dim), O5, K1)
+    else
+      text(dx + 14, dy + 82, "NO SIGNAL", RD, K1)
+      text(dx + 14, dy + 96, "see SYSTEM tab", G1, K1)
+    end
+    text(dx + 14, dy + 180, "FIRST SEEN", G1, K1); text(dx + 100, dy + 180, fmtDT(selP.first), G2, K1)
+    text(dx + 14, dy + 192, "LAST SEEN", G1, K1);  text(dx + 100, dy + 192, fmtDT(selP.seen), G2, K1)
+    text(dx + 14, dy + 204, "SAMPLES", G1, K1)
+    text(dx + 100, dy + 204, tostring(data.heat[selName] and #data.heat[selName] or 0), G2, K1)
+    btn("trkheat", dx + 14, dy + dh - 74, detW - 28, 28, "VIEW HEATMAP", "solid", nil, K1)
+    btn("trkdel", dx + 14, dy + dh - 38, detW - 28, 28, "DELETE PLAYER DATA", "dangero", nil, K1)
   end
-  local name = trk.sel
-  text(dx + 3, y + 2, trunc(name:upper(), dw - 6), userColor(name), C.panel)
-  fill(dx + 3, y + 3, dw - 6, 1, userColor(name))
-  if p.online then
-    text(dx + 3, y + 5, "  ONLINE  ", C.bg, C.green)
-  else
-    text(dx + 3, y + 5, "  OFFLINE  ", C.bg, C.red)
-    text(dx + 16, y + 5, "seen " .. ago(p.seen) .. " ago", C.dim, C.panel)
-  end
-  local rows = { { " X ", C.orange, p.x }, { " Y ", C.lime, p.y }, { " Z ", C.cyan, p.z } }
-  for i, r in ipairs(rows) do
-    text(dx + 3, y + 7 + (i - 1) * 2, r[1], C.bg, r[2])
-    text(dx + 8, y + 7 + (i - 1) * 2, tostring(r[3]), C.text, C.panel)
-  end
-  text(dx + 3, y + 14, "DIM", C.bg, dimColor(p.dim))
-  text(dx + 8, y + 14, dimShort(p.dim), dimColor(p.dim), C.panel)
-  text(dx + 3, y + 16, "First seen", C.dim, C.panel);  text(dx + 15, y + 16, fmtDT(p.first), C.text, C.panel)
-  text(dx + 3, y + 17, "Last seen", C.dim, C.panel);   text(dx + 15, y + 17, fmtDT(p.seen), C.text, C.panel)
-  text(dx + 3, y + 18, "Samples", C.dim, C.panel);     text(dx + 15, y + 18, tostring(data.heat[name] and #data.heat[name] or 0), C.text, C.panel)
-
-  button("trkheat", dx + 3, y + h - 8, dw - 6, 3, "VIEW HEATMAP", C.orange, C.bg)
-  button("trkdel", dx + 3, y + h - 4, dw - 6, 3, "DELETE PLAYER DATA", C.red, C.bg)
 end
 
 --------------------------------------------------------------------
@@ -602,70 +969,60 @@ local function userSummary()
   if n == 0 then return "Anyone" elseif n == 1 then return last else return n .. " players" end
 end
 
-local function drawChat(x, y, w, h)
-  local gap = 1
-  local bw = math.floor((w - 3 * gap) / 4)
-  local function fb(id, i, row, label, val, active, col, span)
-    local bx = x + (i - 1) * (bw + gap)
-    local bwid = bw * (span or 1) + gap * ((span or 1) - 1)
-    local bg = active and col or C.panel2
-    local fg = active and C.bg or C.text
-    fill(bx, row, bwid, 3, bg)
-    text(bx + 2, row + 1, label, active and C.bg or col, bg)
-    text(bx + 2 + #label + 1, row + 1, trunc(val, bwid - #label - 5), fg, bg)
-    hits[#hits + 1] = { x = bx, y = row, w = bwid, h = 3, id = id }
-  end
-  fb("fuser", 1, y, "USER", userSummary(), next(cs.users) ~= nil, C.cyan)
-  fb("fday", 2, y, "DAY", DAYS[cs.day], cs.day > 1, C.blue)
-  fb("ftime", 3, y, "TIME", TIMES[cs.time], cs.time > 1, C.purple)
-  fb("flen", 4, y, "LENGTH", LENS[cs.len], cs.len > 1, C.pink)
-  fb("fsearch", 1, y + 4, "SEARCH", cs.q ~= "" and ('"' .. cs.q .. '"') or "tap to search messages...", cs.q ~= "", C.orange, 2)
-  fb("fevents", 3, y + 4, "JOIN/LEAVE", cs.events and "SHOWN" or "HIDDEN", not cs.events, C.yellow)
-  button("freset", x + 3 * (bw + gap), y + 4, bw, 3, "RESET FILTERS", C.panel2, C.red)
+local function drawChat()
+  local lx, rb = M, PXW - M
+  local timeW = 84
+  local maxw = rb - lx - timeW - 22
+  buildChat(maxw)
 
-  local py, ph = y + 8, h - 8
-  panel(x, py, w, ph, nil, C.purple)
-  buildChat(w)
-  local total = #data.chat
-  text(x + 2, py, "CHAT HISTORY", C.purple, C.panel)
-  text(x + 16, py, #cs.filtered .. " shown / " .. total .. " stored", C.dim, C.panel)
+  -- info line
+  local info = #cs.filtered .. " of " .. #data.chat .. " messages"
+  local nf = activeFilterCount()
+  if nf > 0 then info = info .. "   |   " .. nf .. " filter" .. (nf > 1 and "s" or "") .. " active" end
+  if not chatBox then info = info .. "   |   NO CHAT BOX CONNECTED" end
+  text(lx, CY0, info, chatBox and G1 or RD, K0)
+  rect(lx, CY0 + 12, rb - lx, 1, K3)
 
-  local ly, lh = py + 1, ph - 5
-  local lines = cs.lines
-  local maxScroll = math.max(0, #lines - lh)
-  cs.scroll = clamp(cs.scroll, 0, maxScroll)
-  local endIdx = #lines - cs.scroll
-  local startIdx = math.max(1, endIdx - lh + 1)
-  for k = startIdx, endIdx do
-    local ln = lines[k]
-    local row = ly + (k - startIdx)
-    local sel = cs.sel[ln.e]
-    local bg = sel and C.panel2 or C.panel
-    fill(x + 1, row, w - 1, 1, bg)
-    if sel then fill(x + 1, row, 1, 1, C.purple) end
-    if ln.first then text(x + 2, row, fmtDT(ln.e[1]), C.dim, bg) end
-    local cx = x + 15
-    if ln.first and ln.nl > 0 then
-      text(cx, row, ln.s:sub(1, ln.nl), userColor(ln.e[3]), bg)
-      text(cx + ln.nl, row, ln.s:sub(ln.nl + 1), ln.col, bg)
-    else
-      text(cx, row, ln.s, ln.col, bg)
-    end
-    hits[#hits + 1] = { x = x + 1, y = row, w = w - 1, h = 1, id = "cmsg", data = ln.e }
-  end
-  if #lines == 0 then ctext(x, w, ly + math.floor(lh / 2), "No messages match your filters", C.dim, C.panel) end
-
-  -- action bar
-  local by = py + ph - 3
   local nsel = 0
   for _ in pairs(cs.sel) do nsel = nsel + 1 end
-  button("cdelsel", x + 2, by, 26, 3, "DELETE SELECTED (" .. nsel .. ")", nsel > 0 and C.red or C.panel2, nsel > 0 and C.bg or C.dim)
-  button("cdelall", x + 29, by, 22, 3, "DELETE ALL SHOWN", #cs.filtered > 0 and C.red or C.panel2, #cs.filtered > 0 and C.bg or C.dim)
-  local rx = x + w - 2
-  button("cbot", rx - 9, by, 9, 3, "LATEST", C.panel2, C.cyan)
-  button("cdn", rx - 17, by, 7, 3, DOWN, C.panel2, C.cyan)
-  button("cup", rx - 25, by, 7, 3, UP, C.panel2, C.cyan)
-  button("ctop", rx - 33, by, 7, 3, "TOP", C.panel2, C.cyan)
+  local barH = nsel > 0 and 38 or 0
+  local ly = CY0 + 18
+  local lh = CY1 - barH - ly
+  local rowH = 12
+  local vis = floor(lh / rowH)
+  local lines = cs.lines
+  cs.scroll = clamp(cs.scroll, 0, max(0, #lines - vis))
+  local endIdx = #lines - cs.scroll
+  local startIdx = max(1, endIdx - vis + 1)
+  rect(lx, ly, rb - lx - 10, lh, K0)
+  for k = startIdx, endIdx do
+    local ln = lines[k]
+    local row = ly + (k - startIdx) * rowH
+    local sel = cs.sel[ln.e]
+    local bg = sel and K2 or K0
+    if sel then rect(lx, row, rb - lx - 12, rowH, K2); rect(lx, row, 3, rowH, O4) end
+    if ln.first then text(lx + 8, row + 1, fmtDT(ln.e[1]), G1, bg) end
+    local cx = lx + timeW
+    if ln.first and ln.nl > 0 then
+      local head = ln.s:sub(1, ln.nl)
+      text(cx, row + 1, head, O5, bg)
+      text(cx + textW(head, 1), row + 1, ln.s:sub(ln.nl + 1), ln.col, bg)
+    else
+      text(cx, row + 1, ln.s, ln.col, bg)
+    end
+    addHit("cmsg", lx, row, rb - lx - 12, rowH, ln.e)
+  end
+  if #lines == 0 then ctext(lx, rb - lx, ly + 50, "NO MESSAGES MATCH", G1, K0, 1) end
+  scrollbar("chatscroll", rb - 6, ly, lh, #lines, vis, #lines - vis - cs.scroll)
+
+  if nsel > 0 then
+    local by = CY1 - barH + 4
+    rect(lx, by - 4, rb - lx, barH, K1)
+    rect(lx, by - 4, rb - lx, 1, O3)
+    text(lx + 12, by + 10, nsel .. " SELECTED", O5, K1)
+    btn("cclear", rb - 250, by, 110, 28, "CLEAR", "outline", nil, K1)
+    btn("cdelsel", rb - 130, by, 120, 28, "DELETE", "danger", nil, K1)
+  end
 end
 
 --------------------------------------------------------------------
@@ -677,7 +1034,6 @@ local function heatPlayers()
   table.sort(a, function(x, y) return x:lower() < y:lower() end)
   return a
 end
-
 local function playerDims(s)
   local seen, out = {}, {}
   for i = 1, #s do
@@ -687,11 +1043,13 @@ local function playerDims(s)
   return out
 end
 
+local STEPS = { 16, 32, 50, 100, 200, 250, 500, 1000, 2000, 5000, 10000, 50000 }
+
 local function buildHeat(s, tp, dimSel, PW, PH)
   local n = #s
   local lo, hi, idx = 1, n, 0
   while lo <= hi do
-    local mid = math.floor((lo + hi) / 2)
+    local mid = floor((lo + hi) / 2)
     if s[mid][1] <= tp then idx = mid; lo = mid + 1 else hi = mid - 1 end
   end
   if idx == 0 then return nil end
@@ -708,13 +1066,31 @@ local function buildHeat(s, tp, dimSel, PW, PH)
     end
   end
   if count == 0 then return { empty = true, dim = dim, idx = idx } end
-  local spanX = math.max(maxX - minX + 1, 48)
-  local spanZ = math.max(maxZ - minZ + 1, 48)
-  local scale = math.min(PW / spanX, PH / spanZ)
+  local spanX = max(maxX - minX + 1, 48)
+  local spanZ = max(maxZ - minZ + 1, 48)
+  local scale = min(PW / spanX, PH / spanZ)
+
+  local pix = {}
+  -- faint grid
+  local step = STEPS[#STEPS]
+  for _, st in ipairs(STEPS) do if st * scale >= 30 then step = st; break end end
+  local x = math.ceil(minX / step) * step
+  while x <= minX + spanX do
+    local c = floor((x - minX) * scale)
+    if c >= 0 and c < PW then for r = 0, PH - 1 do pix[r * PW + c] = (x == 0) and K3 or K2 end end
+    x = x + step
+  end
+  local z = math.ceil(minZ / step) * step
+  while z <= minZ + spanZ do
+    local r = PH - 1 - floor((z - minZ) * scale)
+    if r >= 0 and r < PH then for c = 0, PW - 1 do pix[r * PW + c] = (z == 0) and K3 or K2 end end
+    z = z + step
+  end
+
   local g = {}
-  local function add(x, z, wgt)
-    local c = clamp(math.floor((x - minX) * scale), 0, PW - 1)
-    local r = clamp(PH - 1 - math.floor((z - minZ) * scale), 0, PH - 1)
+  local function add(px, pz, wgt)
+    local c = clamp(floor((px - minX) * scale), 0, PW - 1)
+    local r = clamp(PH - 1 - floor((pz - minZ) * scale), 0, PH - 1)
     local k = r * PW + c
     g[k] = (g[k] or 0) + wgt
   end
@@ -723,9 +1099,9 @@ local function buildHeat(s, tp, dimSel, PW, PH)
     local e = s[i]
     if e[4] == dim then
       if prev and e[1] - prev[1] <= 120 then
-        local dt = math.min(e[1] - prev[1], 30)
-        local steps = math.max(1, math.ceil(math.max(math.abs(e[2] - prev[2]), math.abs(e[3] - prev[3])) * scale))
-        steps = math.min(steps, 400)
+        local dt = min(e[1] - prev[1], 30)
+        local steps = max(1, math.ceil(max(math.abs(e[2] - prev[2]), math.abs(e[3] - prev[3])) * scale))
+        steps = min(steps, 400)
         local wgt = dt / (steps + 1)
         for k = 0, steps do
           local f = k / steps
@@ -739,185 +1115,197 @@ local function buildHeat(s, tp, dimSel, PW, PH)
       prev = nil
     end
   end
-  -- soft glow
   local g2, gmax = {}, 0
   for k, v in pairs(g) do
     g2[k] = (g2[k] or 0) + v
     local c = k % PW
-    if c > 0 then g2[k - 1] = (g2[k - 1] or 0) + v * 0.22 end
-    if c < PW - 1 then g2[k + 1] = (g2[k + 1] or 0) + v * 0.22 end
-    if k >= PW then g2[k - PW] = (g2[k - PW] or 0) + v * 0.22 end
-    if k < PW * (PH - 1) then g2[k + PW] = (g2[k + PW] or 0) + v * 0.22 end
+    if c > 0 then g2[k - 1] = (g2[k - 1] or 0) + v * 0.25 end
+    if c < PW - 1 then g2[k + 1] = (g2[k + 1] or 0) + v * 0.25 end
+    if k >= PW then g2[k - PW] = (g2[k - PW] or 0) + v * 0.25 end
+    if k < PW * (PH - 1) then g2[k + PW] = (g2[k + PW] or 0) + v * 0.25 end
   end
   for _, v in pairs(g2) do if v > gmax then gmax = v end end
-  local pix, lg = {}, math.log(1 + gmax)
+  local lg = math.log(1 + gmax)
   for k, v in pairs(g2) do
     local ratio = lg > 0 and (math.log(1 + v) / lg) or 1
-    pix[k] = HEAT[clamp(math.ceil(ratio * #HEAT), 1, #HEAT)]
+    pix[k] = HEATC[clamp(math.ceil(ratio * #HEATC), 1, #HEATC)]
   end
   local cur = s[idx]
-  local mc, mr
   if cur[4] == dim then
-    mc = clamp(math.floor((cur[2] - minX) * scale), 0, PW - 1)
-    mr = clamp(PH - 1 - math.floor((cur[3] - minZ) * scale), 0, PH - 1)
+    local mc = clamp(floor((cur[2] - minX) * scale), 0, PW - 1)
+    local mr = clamp(PH - 1 - floor((cur[3] - minZ) * scale), 0, PH - 1)
     local function mk(c, r, col)
       if c >= 0 and c < PW and r >= 0 and r < PH then pix[r * PW + c] = col end
     end
-    mk(mc - 1, mr, C.text); mk(mc + 1, mr, C.text); mk(mc, mr - 1, C.text); mk(mc, mr + 1, C.text)
-    mk(mc, mr, C.pink)
+    for d = 2, 3 do
+      mk(mc - d, mr, WH); mk(mc + d, mr, WH); mk(mc, mr - d, WH); mk(mc, mr + d, WH)
+    end
+    mk(mc, mr, YL); mk(mc - 1, mr, YL); mk(mc + 1, mr, YL); mk(mc, mr - 1, YL); mk(mc, mr + 1, YL)
   end
   return { pix = pix, idx = idx, dim = dim, minX = minX, minZ = minZ,
            maxX = minX + spanX - 1, maxZ = minZ + spanZ - 1,
-           spanX = spanX, spanZ = spanZ, scale = scale, cur = cur }
+           spanX = spanX, spanZ = spanZ, scale = scale, cur = cur, step = step }
 end
 
--- draws a 2x3 sub-pixel grid using teletext characters
-local function drawPixelGrid(x0, y0, cw, chh, pix, PW)
-  local blit = colors.toBlit
-  local bgc0 = C.bg
-  for cy = 0, chh - 1 do
-    local chars, fgs, bgs = {}, {}, {}
-    for cx = 0, cw - 1 do
-      local bx, by = cx * 2, cy * 3
-      local p = {
-        pix[by * PW + bx] or bgc0,       pix[by * PW + bx + 1] or bgc0,
-        pix[(by + 1) * PW + bx] or bgc0, pix[(by + 1) * PW + bx + 1] or bgc0,
-        pix[(by + 2) * PW + bx] or bgc0, pix[(by + 2) * PW + bx + 1] or bgc0,
-      }
-      local bgc = p[6]
-      local fgc, best = bgc, -1
-      for i = 1, 5 do
-        if p[i] ~= bgc then
-          local r = RANK[p[i]] or 0
-          if r > best then best = r; fgc = p[i] end
-        end
-      end
-      local code = 128
-      for i = 1, 5 do
-        if p[i] ~= bgc then code = code + 2 ^ (i - 1) end
-      end
-      chars[#chars + 1] = string.char(code)
-      fgs[#fgs + 1] = blit(fgc)
-      bgs[#bgs + 1] = blit(bgc)
+local HL = {}
+local PIECE = {}
+local function heatLayout()
+  local hs = CONFIG.HEAT_PX
+  HL.hs = hs
+  HL.cx, HL.cy = M, CY0
+  HL.PW = floor((PXW - 2 * M) / hs)
+  HL.PH = floor((CY1 - CY0 - 62) / hs)
+  HL.cw, HL.ch = HL.PW * hs, HL.PH * hs
+  HL.ctrlY = HL.cy + HL.ch + 10
+end
+
+local function pushCanvas(res)
+  local hs, PW, PH = HL.hs, HL.PW, HL.PH
+  local pix = res and res.pix or {}
+  local rows = {}
+  for r = 0, PH - 1 do
+    local t, base = {}, r * PW
+    for c = 0, PW - 1 do
+      local col = pix[base + c] or K0
+      local pc = PIECE[col]
+      if not pc then pc = string.rep(string.char(col), hs); PIECE[col] = pc end
+      t[c + 1] = pc
     end
-    win.setCursorPos(x0, y0 + cy)
-    win.blit(table.concat(chars), table.concat(fgs), table.concat(bgs))
+    local s = table.concat(t)
+    for _ = 1, hs do rows[#rows + 1] = s end
+  end
+  put(HL.cx, HL.cy, rows)
+end
+
+local function heatControls(register)
+  local s = hm.player and data.heat[hm.player]
+  local y = HL.ctrlY
+  local x, w = M, PXW - 2 * M
+  rect(x, y, w, 62, K0)
+  -- timeline
+  rect(x, y, w, 6, K2)
+  if s then
+    local t0, tN = s[1][1], s[#s][1]
+    local frac = (hm.tp - t0) / max(1, tN - t0)
+    local fw = floor(frac * w)
+    rect(x, y, fw, 6, O4)
+    rect(clamp(x + fw - 2, x, x + w - 4), y - 3, 4, 12, WH)
+    text(x, y + 12, fmtDT(t0), G1, K0)
+    rtext(x + w, y + 12, fmtDT(tN), G1, K0)
+    ctext(x, w, y + 12, fmtDT(hm.tp) .. ":" .. string.format("%02d", floor(hm.tp) % 60), G2, K0)
+  end
+  if register then addHit("hseek", x, y - 6, w, 20) end
+  -- icon row
+  local iy = y + 28
+  local function ib(id, name, ix, iw, active)
+    rect(ix, iy, iw, 26, K0)
+    local w0, h0 = iconSize(name, 1)
+    icon(ix + floor((iw - w0) / 2), iy + floor((26 - h0) / 2), name, active and O4 or O5, K0, 1)
+    if register then addHit(id, ix, iy, iw, 26) end
+  end
+  ib("hstart", "start", x, 34)
+  ib("hrew", "rew", x + 36, 40, hm.playing and hm.rate < 0)
+  ib("hplay", hm.playing and "pause" or "play", x + 78, 40, true)
+  ib("hff", "ff", x + 120, 40, hm.playing and hm.rate > 0)
+  ib("hend", "finish", x + 162, 34)
+  local lab = hm.playing and (math.abs(hm.rate) .. "x " .. (hm.rate < 0 and "REWIND" or "PLAY")) or "PAUSED"
+  text(x + 208, iy + 9, lab, hm.playing and O4 or G1, K0)
+  if s then
+    local info = string.upper(hm.player) .. "   " .. #s .. " SAMPLES   " .. fmtDur(max(0, s[#s][1] - s[1][1])) .. " TRACKED"
+    rtext(x + w, iy + 9, fit(info, w - 300, 1), G1, K0)
   end
 end
 
-local function drawHeat(x, y, w, h)
+local function heatDynamic(register)
+  local s = hm.player and data.heat[hm.player]
+  local res
+  if s and #s > 0 then
+    local t0, tN = s[1][1], s[#s][1]
+    if hm.follow or not hm.tp then hm.tp = tN end
+    hm.tp = clamp(hm.tp, t0, tN)
+    res = buildHeat(s, hm.tp, hm.dim, HL.PW, HL.PH)
+  else
+    s = nil
+  end
+  pushCanvas(res and res.pix and res or nil)
+  if res and res.pix then
+    local lo = string.format("X%d Z%d", res.minX, res.minZ)
+    local hi = string.format("X%d Z%d", res.maxX, res.maxZ)
+    text(HL.cx + 3, HL.cy + HL.ch - 11, lo, G1, K0)
+    rtext(HL.cx + HL.cw - 3, HL.cy + 3, hi, G1, K0)
+    local cur = string.format("%s   X %d   Z %d   GRID %d", dimShort(res.cur[4]), res.cur[2], res.cur[3], res.step)
+    rtext(HL.cx + HL.cw - 3, HL.cy + HL.ch - 11, cur, O5, K0)
+  else
+    local msg
+    if not s then msg = "NO MOVEMENT DATA RECORDED YET"
+    elseif res and res.empty then msg = "NO DATA IN THIS DIMENSION"
+    else msg = "PLAYHEAD IS BEFORE THE FIRST SAMPLE" end
+    ctext(HL.cx, HL.cw, HL.cy + floor(HL.ch / 2), msg, G1, K0)
+  end
+  heatControls(register)
+end
+
+local function drawHeat()
   local list = heatPlayers()
   if not hm.player or not data.heat[hm.player] or #data.heat[hm.player] == 0 then
     hm.player = list[1]; hm.tp = nil; hm.follow = true; hm.dim = nil; hm.playing = false
   end
-
-  -- top bar
-  fill(x, y, w, 3, C.panel)
-  fill(x, y, 1, 3, C.orange)
-  button("hprev", x + 2, y, 5, 3, REWR, C.panel2, C.orange)
-  local pname = hm.player or "no data"
-  fill(x + 8, y, 22, 3, C.panel2)
-  ctext(x + 8, 22, y + 1, trunc(pname, 20), hm.player and userColor(pname) or C.dim, C.panel2)
-  button("hnext", x + 31, y, 5, 3, PLAYR, C.panel2, C.orange)
-  local s = hm.player and data.heat[hm.player]
-  local dimLabel = "AUTO"
-  if hm.dim then dimLabel = dimShort(hm.dim):upper() end
-  button("hdim", x + 38, y, 26, 3, "DIMENSION: " .. dimLabel, hm.dim and (dimColor(hm.dim)) or C.panel2, hm.dim and C.bg or C.text)
-  if s then
-    text(x + 66, y + 1, #s .. " samples  |  " .. fmtDur(math.max(0, s[#s][1] - s[1][1])) .. " tracked", C.dim, C.panel)
-  end
-
-  local statW = 26
-  local cpy, cph = y + 4, h - 4 - 6
-  local cpw = w - statW - 1
-  panel(x, cpy, cpw, cph, "MOVEMENT HEATMAP", C.orange)
-  panel(x + cpw + 1, cpy, statW, cph, "PLAYBACK INFO", C.cyan)
-
-  local cw, chh = cpw - 2, cph - 2
-  local cx0, cy0 = x + 1, cpy + 1
-  local PW, PH = cw * 2, chh * 3
-  fill(cx0, cy0, cw, chh, C.bg)
-
-  local t0, tN, span
-  if s then
-    t0, tN = s[1][1], s[#s][1]
-    span = math.max(tN - t0, 60)
-    if hm.follow or not hm.tp then hm.tp = tN end
-    hm.tp = clamp(hm.tp, t0, tN)
-  end
-
-  local res
-  if s then res = buildHeat(s, hm.tp, hm.dim, PW, PH) end
-  local ix = x + cpw + 3
-  local iw = statW - 3
-  if res and res.pix then
-    drawPixelGrid(cx0, cy0, cw, chh, res.pix, PW)
-    local lo = string.format("X%d Z%d", res.minX, res.minZ)
-    local hi = string.format("X%d Z%d", res.maxX, res.maxZ)
-    text(cx0, cy0 + chh - 1, lo, C.dim, C.bg)
-    text(cx0 + cw - #hi, cy0, hi, C.dim, C.bg)
-
-    text(ix, cpy + 2, "TIME", C.orange, C.panel)
-    text(ix, cpy + 3, fmtDT(hm.tp) .. ":" .. string.format("%02d", hm.tp % 60), C.text, C.panel)
-    text(ix, cpy + 5, "POSITION", C.orange, C.panel)
-    text(ix, cpy + 6, "X " .. res.cur[2], C.text, C.panel)
-    text(ix, cpy + 7, "Z " .. res.cur[3], C.text, C.panel)
-    text(ix, cpy + 9, "DIMENSION", C.orange, C.panel)
-    text(ix, cpy + 10, dimShort(res.cur[4]), dimColor(res.cur[4]), C.panel)
-    text(ix, cpy + 12, "AREA", C.orange, C.panel)
-    text(ix, cpy + 13, math.floor(res.spanX) .. " x " .. math.floor(res.spanZ), C.text, C.panel)
-    text(ix, cpy + 14, string.format("%.2f blk/px", 1 / res.scale), C.dim, C.panel)
-    text(ix, cpy + 16, "PROGRESS", C.orange, C.panel)
-    text(ix, cpy + 17, res.idx .. " / " .. #s, C.text, C.panel)
-  elseif res and res.empty then
-    ctext(cx0, cw, cy0 + math.floor(chh / 2), "No data in this dimension yet", C.dim, C.bg)
-  else
-    ctext(cx0, cw, cy0 + math.floor(chh / 2), s and "Playhead is before the first sample" or "No movement data recorded yet", C.dim, C.bg)
-  end
-
-  -- legend
-  text(ix, cpy + cph - 4, "LOW", C.dim, C.panel)
-  text(ix + iw - 4, cpy + cph - 4, "HIGH", C.dim, C.panel)
-  local lw = math.floor(iw / #HEAT)
-  for i, c in ipairs(HEAT) do fill(ix + (i - 1) * lw, cpy + cph - 3, lw, 2, c) end
-
-  -- timeline
-  local ty = y + h - 5
-  local bx, bwid = x + 1, w - 2
-  fill(bx, ty, bwid, 2, C.panel2)
-  if s then
-    local frac = (hm.tp - t0) / math.max(1, tN - t0)
-    local fw = math.floor(frac * bwid)
-    local seg = math.max(1, math.ceil(bwid / #HEAT))
-    for i = 0, fw - 1 do
-      fill(bx + i, ty, 1, 2, HEAT[clamp(math.floor(i / seg) + 1, 1, #HEAT)])
-    end
-    fill(clamp(bx + fw, bx, bx + bwid - 1), ty, 1, 2, C.text)
-    text(bx, ty + 2, fmtDT(t0), C.dim, C.bg)
-    local e = fmtDT(tN)
-    text(bx + bwid - #e, ty + 2, e, C.dim, C.bg)
-    local mid = fmtTime(hm.tp)
-    ctext(bx, bwid, ty + 2, mid, C.text, C.bg)
-  end
-  hits[#hits + 1] = { x = bx, y = ty, w = bwid, h = 2, id = "hseek" }
-
-  -- control buttons
-  local by = y + h - 2 - 0
-  by = ty + 3
-  local bh = math.max(1, (y + h) - by)
-  bh = math.min(bh, 3)
-  button("hstart", x + 1, by, 7, bh, "|" .. REWR, C.panel2, C.cyan)
-  button("hrew", x + 9, by, 9, bh, REWR .. REWR, C.panel2, C.cyan)
-  button("hplay", x + 19, by, 14, bh, hm.playing and "|| PAUSE" or (PLAYR .. " PLAY"), hm.playing and C.orange or C.green, C.bg)
-  button("hff", x + 34, by, 9, bh, PLAYR .. PLAYR, C.panel2, C.cyan)
-  button("hend", x + 44, by, 7, bh, PLAYR .. "|", C.panel2, C.cyan)
-  local lab = hm.playing and ((hm.rate < 0 and (REWR .. REWR .. " ") or (PLAYR .. PLAYR .. " ")) .. math.abs(hm.rate) .. "x") or "paused"
-  text(x + 53, by + math.floor((bh - 1) / 2), lab, hm.playing and C.orange or C.dim, C.bg)
-  button("hdel", x + w - 26, by, 25, bh, "DELETE HISTORY", C.red, C.bg)
+  heatLayout()
+  rect(HL.cx - 1, HL.cy - 1, HL.cw + 2, HL.ch + 2, K3)
+  heatDynamic(true)
 end
 
 --------------------------------------------------------------------
--- MODALS
+-- SYSTEM TAB  (live diagnostics)
+--------------------------------------------------------------------
+local function drawSystem()
+  local lx, rb = M, PXW - M
+  local y = CY0
+  text(lx, y, "SYSTEM DIAGNOSTICS", O4, K0)
+  y = y + 14
+  rect(lx, y, rb - lx, 1, K3)
+  y = y + 8
+  local labW = 170
+  local function line(label, value, col)
+    if y > CY1 - 40 then return end
+    text(lx, y, label, G1, K0)
+    local ls = wrapPx(sanitize(value), rb - lx - labW - 10)
+    for _, s in ipairs(ls) do
+      if y > CY1 - 40 then return end
+      text(lx + labW, y, s, col or WH, K0); y = y + 12
+    end
+    y = y + 3
+  end
+  local detName = peripheral.getName(detector)
+  line("PLAYER DETECTOR", detName, O5)
+  line("DETECTOR METHODS", diag.methods, G2)
+  if diag.err ~= "" then line("DETECTOR ERROR", diag.err, RD)
+  else line("DETECTOR STATUS", "OK - " .. diag.n .. " online player(s) returned", O5) end
+  line("POSITIONS", diag.ok .. " ok   " .. diag.fail .. " failed   method: " .. (diag.how ~= "" and diag.how or "-"),
+       diag.fail > 0 and RD or WH)
+  line("RAW POSITION DATA", diag.raw, G2)
+  line("CHAT BOX", chatBox and ("connected   " .. diag.chatN .. " chat events received" ..
+       (diag.chatLast > 0 and ("   last " .. ago(diag.chatLast) .. " ago") or "")) or "NOT FOUND", chatBox and WH or RD)
+  local nbtLine = "not connected (disk only)"
+  if nbt then
+    nbtLine = (nbtOK and "OK" or "FAILING") .. "   last write " .. lastSaveBytes .. " bytes   budget " .. nbtBudget
+    if diag.nbtErr ~= "" then nbtLine = nbtLine .. "   " .. diag.nbtErr end
+  end
+  line("NBT STORAGE", nbtLine, (nbt and not nbtOK) and RD or WH)
+  line("DISK COPY", diag.localBytes .. " bytes in " .. CONFIG.LOCAL_FILE .. (diag.saveErr ~= "" and ("   ERROR " .. diag.saveErr) or ""),
+       diag.saveErr ~= "" and RD or WH)
+  line("DATA", #data.chat .. " chat entries   " .. (function() local c = 0 for _ in pairs(data.players) do c = c + 1 end return c end)() .. " players",
+       WH)
+  line("DISPLAY", PXW .. "x" .. PXH .. " px   " .. W .. "x" .. H .. " chars   palette " .. (palOK and "custom" or "default"), WH)
+  line("LAST TOUCH", diag.touch, WH)
+  line("LAST ERROR", diag.lastErr ~= "" and diag.lastErr or "none", diag.lastErr ~= "" and RD or G1)
+
+  btn("syssave", lx, CY1 - 30, 140, 26, "SAVE NOW", "outline", nil, K0)
+  btn("sysdebug", lx + 150, CY1 - 30, 190, 26, "WRITE DEBUG FILE", "outline", nil, K0)
+end
+
+--------------------------------------------------------------------
+-- DRAWERS + MODALS
 --------------------------------------------------------------------
 local function allUsers()
   local set = {}
@@ -929,163 +1317,266 @@ local function allUsers()
   return a
 end
 
+local function drawerBase(w, title)
+  addHit("drawerclose", 0, HDR, PXW, CY1 + 6 - HDR)           -- scrim
+  local x, y, h = PXW - w, HDR + 1, CY1 + 6 - HDR - 1
+  rect(x, y, w, h, K1)
+  rect(x, y, 2, h, O4)
+  text(x + 18, y + 14, title, O4, K1)
+  iconBtn("drawerclose", x + w - 34, y + 8, 26, 22, "x", O5, K1)
+  rect(x + 14, y + 32, w - 28, 1, K3)
+  return x, y, w, h
+end
+
+local function drawerRow(id, x, y, w, label, value, d)
+  rect(x + 14, y, w - 28, 38, K1)
+  text(x + 14, y + 6, label, G1, K1)
+  text(x + 14, y + 19, fit(value, w - 56, 1), O5, K1)
+  rect(x + 14, y + 36, w - 28, 1, K2)
+  addHit(id, x + 8, y, w - 16, 38, d)
+end
+
+local function drawFilterDrawer()
+  local x, y, w, h = drawerBase(300, "FILTERS")
+  local ry = y + 42
+  drawerRow("fuser", x, ry, w, "USER", userSummary()); ry = ry + 40
+  drawerRow("fday", x, ry, w, "DAY", DAYS[cs.day]); ry = ry + 40
+  drawerRow("ftime", x, ry, w, "TIME", TIMES[cs.time]); ry = ry + 40
+  drawerRow("flen", x, ry, w, "LENGTH", LENS[cs.len]); ry = ry + 40
+  drawerRow("fevents", x, ry, w, "JOIN / LEAVE MESSAGES", cs.events and "SHOWN" or "HIDDEN"); ry = ry + 40
+  drawerRow("fsearch", x, ry, w, "SEARCH PHRASE", cs.q ~= "" and ('"' .. cs.q .. '"') or "tap to type..."); ry = ry + 48
+  btn("freset", x + 14, ry, w - 28, 26, "RESET FILTERS", "outline", nil, K1)
+  local n = #cs.filtered
+  btn("cdelall", x + 14, y + h - 40, w - 28, 28, "DELETE ALL SHOWN (" .. n .. ")", n > 0 and "dangero" or "outline", nil, K1)
+end
+
+local function drawHeatDrawer()
+  local x, y, w, h = drawerBase(300, "HEATMAP OPTIONS")
+  local ry = y + 42
+  drawerRow("hmplayer", x, ry, w, "PLAYER", hm.player or "none"); ry = ry + 40
+  local dl = "Auto (follow player)"
+  if hm.dim then dl = dimShort(hm.dim) end
+  drawerRow("hmdim", x, ry, w, "DIMENSION", dl)
+  btn("hmdel", x + 14, y + h - 40, w - 28, 28, "DELETE HISTORY", hm.player and "dangero" or "outline", nil, K1)
+end
+
 local function drawConfirm(m)
-  local bw, bh = 56, 12
-  local bx, by = math.floor((W - bw) / 2) + 1, math.floor((H - bh) / 2) + 1
-  fill(bx - 1, by - 1, bw + 2, bh + 2, C.bg)
-  fill(bx, by, bw, bh, C.panel)
-  fill(bx, by, bw, 1, C.red)
-  ctext(bx, bw, by, "CONFIRM DELETE", C.bg, C.red)
-  for i, l in ipairs(wrap(m.msg, bw - 8)) do
-    if i <= 4 then ctext(bx, bw, by + 1 + i, l, C.text, C.panel) end
-  end
-  ctext(bx, bw, by + bh - 6, "This cannot be undone.", C.orange, C.panel)
-  button("mcancel", bx + 4, by + bh - 4, 22, 3, "CANCEL", C.panel2, C.text)
-  button("mconfirm", bx + bw - 26, by + bh - 4, 22, 3, "DELETE", C.red, C.bg)
+  local bw, bh = 400, 150
+  local bx, by = floor((PXW - bw) / 2), floor((PXH - bh) / 2)
+  rect(bx - 2, by - 2, bw + 4, bh + 4, RD)
+  rect(bx, by, bw, bh, K1)
+  text(bx + 20, by + 16, "CONFIRM DELETE", RD, K1, 1)
+  rect(bx + 20, by + 30, bw - 40, 1, K3)
+  local lines = wrapPx(m.msg, bw - 40)
+  for i = 1, min(#lines, 4) do text(bx + 20, by + 40 + (i - 1) * 12, lines[i], WH, K1) end
+  text(bx + 20, by + bh - 62, "THIS CANNOT BE UNDONE.", G1, K1)
+  btn("mcancel", bx + 20, by + bh - 40, 150, 28, "CANCEL", "outline", nil, K1)
+  btn("mconfirm", bx + bw - 170, by + bh - 40, 150, 28, "DELETE", "danger", nil, K1)
 end
 
 local function drawKbd(m)
-  local kw, kh = 7, 3
-  local bw = 86
-  local bh = 6 + 5 * (kh + 1) + 1
-  local bx, by = math.floor((W - bw) / 2) + 1, math.floor((H - bh) / 2) + 1
-  fill(bx - 1, by - 1, bw + 2, bh + 2, C.bg)
-  fill(bx, by, bw, bh, C.panel)
-  fill(bx, by, bw, 1, C.orange)
-  ctext(bx, bw, by, m.title or "SEARCH", C.bg, C.orange)
-  fill(bx + 2, by + 2, bw - 4, 3, C.panel2)
-  local shown = trunc(m.buf, bw - 10)
-  text(bx + 4, by + 3, shown, C.text, C.panel2)
-  text(bx + 4 + #shown, by + 3, (math.floor(os.clock() * 2) % 2 == 0) and "_" or " ", C.orange, C.panel2)
+  local kw, kh, gap = 50, 28, 6
+  local bw = 10 * (kw + gap) - gap + 46
+  local bh = 28 + 40 + 8 + 4 * (kh + gap) + kh + 24
+  local bx, by = floor((PXW - bw) / 2), floor((PXH - bh) / 2)
+  rect(bx - 2, by - 2, bw + 4, bh + 4, O4)
+  rect(bx, by, bw, bh, K1)
+  text(bx + 23, by + 12, m.title or "SEARCH", O4, K1)
+  rect(bx + 23, by + 28, bw - 46, 32, K3)
+  rect(bx + 24, by + 29, bw - 48, 30, K0)
+  local shown = fit(m.buf, bw - 80, 2)
+  text(bx + 34, by + 36, shown, WH, K0, 2)
+  rect(bx + 34 + textW(shown, 2), by + 36, 2, 14, O4)
   local rows = { "1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm.!?" }
   for r, row in ipairs(rows) do
-    local off = (r == 3) and math.floor((kw + 1) / 2) or 0
+    local off = (r == 3) and floor((kw + gap) / 2) or 0
     for c = 1, #row do
       local ch = row:sub(c, c)
-      button("key", bx + 3 + off + (c - 1) * (kw + 1), by + 6 + (r - 1) * (kh + 1), kw, kh, ch, C.panel2, C.text, ch)
+      btn("key", bx + 23 + off + (c - 1) * (kw + gap), by + 70 + (r - 1) * (kh + gap), kw, kh, ch, "outline", ch, K1)
     end
   end
-  local yy = by + 6 + 4 * (kh + 1)
-  local xx = bx + 3
-  button("mcancel", xx, yy, 12, kh, "CANCEL", C.panel2, C.text); xx = xx + 13
-  button("kclr", xx, yy, 10, kh, "CLEAR", C.red, C.bg); xx = xx + 11
-  button("key", xx, yy, 30, kh, "SPACE", C.panel2, C.text, " "); xx = xx + 31
-  button("kbs", xx, yy, 12, kh, "BKSP", C.orange, C.bg); xx = xx + 13
-  button("kok", xx, yy, 14, kh, "SEARCH", C.green, C.bg)
+  local yy = by + 70 + 4 * (kh + gap)
+  local xx = bx + 23
+  btn("mcancel", xx, yy, 90, kh, "CANCEL", "outline", nil, K1); xx = xx + 96
+  btn("kclr", xx, yy, 70, kh, "CLEAR", "dangero", nil, K1); xx = xx + 76
+  btn("key", xx, yy, 190, kh, "SPACE", "outline", " ", K1); xx = xx + 196
+  btn("kbs", xx, yy, 80, kh, "BKSP", "outline", nil, K1); xx = xx + 86
+  btn("kok", xx, yy, 90, kh, "SEARCH", "solid", nil, K1)
 end
 
-local function drawUsers(m)
-  local bw, bh = 84, math.min(H - 4, 30)
-  local bx, by = math.floor((W - bw) / 2) + 1, math.floor((H - bh) / 2) + 1
-  fill(bx - 1, by - 1, bw + 2, bh + 2, C.bg)
-  fill(bx, by, bw, bh, C.panel)
-  fill(bx, by, bw, 1, C.cyan)
-  ctext(bx, bw, by, "SELECT USERS  (tap to toggle)", C.bg, C.cyan)
-  local users = allUsers()
-  local cols = 3
-  local cwid = math.floor((bw - 6) / cols)
-  local rows = math.floor((bh - 7) / 2)
+local function drawPicker(m)
+  local bw, bh = 600, min(PXH - 30, 290)
+  local bx, by = floor((PXW - bw) / 2), floor((PXH - bh) / 2)
+  rect(bx - 2, by - 2, bw + 4, bh + 4, O4)
+  rect(bx, by, bw, bh, K1)
+  text(bx + 20, by + 12, m.title, O4, K1)
+  rect(bx + 20, by + 28, bw - 40, 1, K3)
+  local items = m.items()
+  local cols, cw, rh = 3, floor((bw - 40) / 3), 32
+  local rows = floor((bh - 40 - 56) / rh)
   local per = rows * cols
-  local pages = math.max(1, math.ceil(#users / per))
+  local pages = max(1, math.ceil(#items / per))
   m.page = clamp(m.page, 1, pages)
   for i = 1, per do
-    local name = users[(m.page - 1) * per + i]
+    local name = items[(m.page - 1) * per + i]
     if not name then break end
-    local r, c = math.floor((i - 1) / cols), (i - 1) % cols
-    local on = cs.users[name]
-    button("upick", bx + 3 + c * cwid, by + 2 + r * 2, cwid - 1, 1,
-      (on and "[x] " or "[ ] ") .. name, on and userColor(name) or C.panel2, on and C.bg or userColor(name), name)
+    local r, c = floor((i - 1) / cols), (i - 1) % cols
+    local on = m.isSel(name)
+    btn("pick", bx + 20 + c * cw, by + 38 + r * rh, cw - 8, 26, name, on and "solid" or "outline", name, K1)
   end
-  if #users == 0 then ctext(bx, bw, by + 4, "No users recorded yet", C.dim, C.panel) end
-  local yy = by + bh - 4
-  button("upg-", bx + 3, yy, 7, 3, REWR, C.panel2, C.cyan)
-  ctext(bx + 10, 12, yy + 1, m.page .. "/" .. pages, C.dim, C.panel)
-  button("upg+", bx + 22, yy, 7, 3, PLAYR, C.panel2, C.cyan)
-  button("uclear", bx + bw - 44, yy, 18, 3, "CLEAR ALL", C.red, C.bg)
-  button("udone", bx + bw - 24, yy, 21, 3, "DONE", C.green, C.bg)
+  if #items == 0 then ctext(bx, bw, by + 80, "NOTHING TO PICK YET", G1, K1) end
+  local yy = by + bh - 42
+  btn("pg-", bx + 20, yy, 40, 28, "<", "outline", nil, K1)
+  ctext(bx + 62, 56, yy + 10, m.page .. "/" .. pages, G1, K1)
+  btn("pg+", bx + 122, yy, 40, 28, ">", "outline", nil, K1)
+  if m.clear then btn("pclear", bx + bw - 290, yy, 130, 28, "CLEAR ALL", "dangero", nil, K1) end
+  btn("pdone", bx + bw - 150, yy, 130, 28, "DONE", "solid", nil, K1)
 end
 
 --------------------------------------------------------------------
 -- APP FRAME
 --------------------------------------------------------------------
-local TABS = {
-  { id = "tracking", label = "TRACKING", color = C.blue },
-  { id = "chat",     label = "CHAT LOG", color = C.purple },
-  { id = "heat",     label = "HEATMAP",  color = C.orange },
-}
+local TABS = { { id = "tracking", label = "TRACKING" }, { id = "chat", label = "CHAT LOG" },
+               { id = "heat", label = "HEATMAP" }, { id = "sys", label = "SYSTEM" } }
 
 local function lockRemaining()
-  local r = math.max(0, CONFIG.LOCK_AFTER - (now() - ui.lastAct))
-  return string.format("%d:%02d", math.floor(r / 60), r % 60)
+  local r = max(0, CONFIG.LOCK_AFTER - (now() - ui.lastAct))
+  return string.format("%d:%02d", floor(r / 60), r % 60)
+end
+
+local function drawHeader()
+  rect(0, 0, PXW, HDR, K0)
+  rect(0, 0, PXW, 2, O4)
+  text(M + 2, 8, "NEXUS", O4, K0, 2)
+  text(M + 2 + textW("NEXUS", 2) + 8, 17, "TRACKER", G1, K0)
+  local tx = M + 2 + textW("NEXUS", 2) + 8 + textW("TRACKER", 1) + 24
+  for _, t in ipairs(TABS) do
+    local active = ui.tab == t.id
+    local tw = textW(t.label, 1)
+    text(tx + 14, 13, t.label, active and O4 or G1, K0)
+    if active then rect(tx + 8, 28, tw + 12, 2, O4) end
+    addHit("tab", tx, 4, tw + 28, HDR - 4, t.id)
+    tx = tx + tw + 32
+  end
+  rect(0, HDR, PXW, 1, K3)
+
+  -- right side: lock, context button, clock
+  iconBtn("lock", PXW - M - 26, 8, 26, 20, "lock", O5, K0)
+  rtext(PXW - M - 40, 13, fmtClock(now()), G2, K0)
+  local bx = PXW - M - 40 - textW("00:00", 1) - 20
+  if ui.tab == "chat" then
+    local n = activeFilterCount()
+    local w = 92
+    local style = (n > 0 or ui.drawer == "filter") and "solid" or "outline"
+    btn("filterbtn", bx - w, 7, w, 22, n > 0 and ("FILTER " .. n) or "FILTER", style, nil, K0)
+  elseif ui.tab == "heat" then
+    local w = 92
+    btn("menubtn", bx - w, 7, w, 22, "MENU", ui.drawer == "heat" and "solid" or "outline", nil, K0)
+  end
+end
+
+local function drawFooter()
+  rect(0, PXH - FTR, PXW, FTR, K1)
+  rect(0, PXH - FTR, PXW, 1, K3)
+  local onl = 0
+  for _, p in pairs(data.players) do if p.online then onl = onl + 1 end end
+  rect(M, PXH - 11, 5, 5, onl > 0 and O4 or K3)
+  local parts = onl .. " ONLINE"
+  text(M + 12, PXH - 13, parts, G2, K1)
+  local x = M + 12 + textW(parts, 1) + 22
+  local sv = (lastSave > 0) and ("SAVED " .. ago(lastSave) .. " AGO") or "NOT SAVED YET"
+  text(x, PXH - 13, sv, diag.saveErr ~= "" and RD or G1, K1); x = x + textW(sv, 1) + 22
+  if nbt then
+    local ns = string.format("NBT %.1f/%.1f KB", lastSaveBytes / 1024, nbtBudget / 1024)
+    text(x, PXH - 13, ns, nbtOK and G1 or RD, K1); x = x + textW(ns, 1) + 22
+  end
+  local right = "AUTO-LOCK " .. lockRemaining()
+  local room = PXW - M - textW(right, 1) - 20 - x
+  if diag.err ~= "" then
+    text(x, PXH - 13, fit("DETECTOR ERROR: " .. diag.err, room, 1), RD, K1)
+  elseif diag.fail > 0 then
+    text(x, PXH - 13, fit("NO POSITION DATA FOR " .. diag.fail .. " PLAYER(S) - SEE SYSTEM TAB", room, 1), RD, K1)
+  end
+  rtext(PXW - M, PXH - 13, right, G1, K1)
 end
 
 local function drawApp()
-  fill(1, 1, W, H, C.bg)
-  gradientBar(1)
-  fill(1, 2, W, 3, C.panel)
-  fill(3, 3, 9, 1, C.cyan)
-  text(3, 3, " NEXUS   ", C.bg, C.cyan)
-  text(13, 3, "TRACKER", C.text, C.panel)
-  text(3, 4, "player intelligence", C.dim, C.panel)
-  for i, t in ipairs(TABS) do
-    local tx = 28 + (i - 1) * 19
-    local active = ui.tab == t.id
-    button("tab", tx, 2, 18, 3, t.label, active and t.color or C.panel2, active and C.bg or t.color, t.id)
-  end
-  button("lock", W - 12, 2, 11, 3, "LOCK", C.red, C.bg)
-  text(W - 25, 3, fmtTime(now()), C.text, C.panel)
-  text(W - 25, 4, os.date("%a %d %b", now()), C.dim, C.panel)
-
-  local cx, cy, cw, ch = 2, 6, W - 2, H - 7
-  if ui.tab == "tracking" then drawTracking(cx, cy, cw, ch)
-  elseif ui.tab == "chat" then drawChat(cx, cy, cw, ch)
-  else drawHeat(cx, cy, cw, ch) end
-
-  -- footer
-  fill(1, H, W, 1, C.panel)
-  local onl = 0
-  for _, p in pairs(data.players) do if p.online then onl = onl + 1 end end
-  dot(2, H, onl > 0 and C.green or C.dim)
-  text(4, H, onl .. " online", C.text, C.panel)
-  local sv = (lastSave > 0) and ("saved " .. ago(lastSave) .. " ago") or "not saved yet"
-  text(16, H, sv, C.dim, C.panel)
-  if nbt then
-    text(34, H, string.format("NBT %.1f/%.1f KB", lastSaveBytes / 1024, CONFIG.NBT_BUDGET / 1024), nbtOK and C.green or C.red, C.panel)
-  end
-  local lk = "auto-lock in " .. lockRemaining()
-  text(W - #lk - 1, H, lk, C.dim, C.panel)
+  rect(0, 0, PXW, PXH, K0)
+  drawHeader()
+  if ui.tab == "tracking" then drawTracking()
+  elseif ui.tab == "chat" then drawChat()
+  elseif ui.tab == "sys" then drawSystem()
+  else drawHeat() end
+  if ui.drawer == "filter" and ui.tab == "chat" then drawFilterDrawer()
+  elseif ui.drawer == "heat" and ui.tab == "heat" then drawHeatDrawer()
+  else ui.drawer = nil end
+  drawFooter()
 end
 
 local function render()
   hits = {}
-  win.setVisible(false)
-  win.setCursorBlink(false)
-  if ui.locked then drawLock() else drawApp() end
-  if ui.modal and not ui.locked then
-    local saved = hits
-    hits = {}
-    local m = ui.modal
-    if m.type == "confirm" then drawConfirm(m)
-    elseif m.type == "kbd" then drawKbd(m)
-    elseif m.type == "users" then drawUsers(m) end
-  end
-  win.setVisible(true)
+  freeze(true)
+  local ok, err = pcall(function()
+    if ui.locked then drawLock() else drawApp() end
+    if ui.modal and not ui.locked then
+      hits = {}
+      local m = ui.modal
+      if m.type == "confirm" then drawConfirm(m)
+      elseif m.type == "kbd" then drawKbd(m)
+      elseif m.type == "picker" then drawPicker(m) end
+    end
+  end)
+  freeze(false)
+  if not ok then logErr("render: " .. tostring(err)) end
+end
+
+local function renderHeatFrame()
+  if ui.locked or ui.modal or ui.drawer or ui.tab ~= "heat" then return end
+  freeze(true)
+  local ok, err = pcall(heatDynamic, false)
+  freeze(false)
+  if not ok then logErr("heat frame: " .. tostring(err)) end
 end
 
 --------------------------------------------------------------------
--- INPUT HANDLING
+-- INPUT
 --------------------------------------------------------------------
 local function lock()
-  ui.locked = true; ui.pin = ""; ui.msg = ""; ui.modal = nil
+  ui.locked = true; ui.pin = ""; ui.msg = ""; ui.modal = nil; ui.drawer = nil
   hm.playing = false
 end
-
 local function cycle(v, n) return (v % n) + 1 end
+
+local function openUserPicker()
+  ui.modal = {
+    type = "picker", title = "SELECT USERS  (tap to toggle)", page = 1, clear = true,
+    items = allUsers,
+    isSel = function(n) return cs.users[n] ~= nil end,
+    pick = function(n) cs.users[n] = (not cs.users[n]) or nil; bumpFilter() end,
+    onClear = function() cs.users = {}; bumpFilter() end,
+  }
+end
+local function openHeatPicker()
+  ui.modal = {
+    type = "picker", title = "SELECT PLAYER", page = 1, single = true,
+    items = heatPlayers,
+    isSel = function(n) return hm.player == n end,
+    pick = function(n)
+      hm.player = n; hm.tp = nil; hm.follow = true; hm.dim = nil; hm.playing = false
+    end,
+  }
+end
+
+local function scrollTo(id, ty, up, down)
+  local sb = SB[id]
+  if not sb then return end
+  if ty < sb.ty then up() elseif ty > sb.ty + sb.th then down() end
+end
 
 local function handleHit(h, tx, ty)
   local id, d = h.id, h.data
 
-  -- modals first
+  -- modal controls
   if id == "mcancel" then ui.modal = nil; return end
   if id == "mconfirm" then
     local f = ui.modal and ui.modal.yes
@@ -1093,33 +1584,33 @@ local function handleHit(h, tx, ty)
     if f then f() end
     return
   end
-  if id == "key" then
-    if #ui.modal.buf < 40 then ui.modal.buf = ui.modal.buf .. d end return
+  if id == "key" then if ui.modal and #ui.modal.buf < 40 then ui.modal.buf = ui.modal.buf .. d end return
   elseif id == "kbs" then ui.modal.buf = ui.modal.buf:sub(1, -2) return
   elseif id == "kclr" then ui.modal.buf = "" return
-  elseif id == "kok" then
-    cs.q = ui.modal.buf; ui.modal = nil; bumpFilter(); return
-  elseif id == "upick" then
-    cs.users[d] = (not cs.users[d]) or nil; bumpFilter(); return
-  elseif id == "uclear" then cs.users = {}; bumpFilter(); return
-  elseif id == "udone" then ui.modal = nil; return
-  elseif id == "upg-" then ui.modal.page = ui.modal.page - 1; return
-  elseif id == "upg+" then ui.modal.page = ui.modal.page + 1; return
+  elseif id == "kok" then cs.q = ui.modal.buf; ui.modal = nil; bumpFilter(); return
+  elseif id == "pick" then
+    ui.modal.pick(d)
+    if ui.modal.single then ui.modal = nil end
+    return
+  elseif id == "pclear" then ui.modal.onClear(); return
+  elseif id == "pdone" then ui.modal = nil; return
+  elseif id == "pg-" then ui.modal.page = ui.modal.page - 1; return
+  elseif id == "pg+" then ui.modal.page = ui.modal.page + 1; return
   end
 
   -- lock screen
   if id == "pin" then
     if now() < ui.lockUntil then return end
     ui.msg = ""
-    if d == "C" then ui.pin = ""
-    elseif d == "<" then ui.pin = ui.pin:sub(1, -2)
-    elseif #ui.pin < 4 then
+    if d == "CLR" then ui.pin = ""
+    elseif d == "DEL" then ui.pin = ui.pin:sub(1, -2)
+    elseif #ui.pin < #CONFIG.PIN then
       ui.pin = ui.pin .. d
-      if #ui.pin == 4 then
+      if #ui.pin == #CONFIG.PIN then
         if ui.pin == CONFIG.PIN then
           ui.locked = false; ui.pin = ""; ui.wrong = 0; ui.lastAct = now()
         else
-          ui.pin = ""; ui.wrong = ui.wrong + 1; ui.msg = "Incorrect PIN"
+          ui.pin = ""; ui.wrong = ui.wrong + 1; ui.msg = "INCORRECT PIN"
           if ui.wrong >= 5 then ui.lockUntil = now() + 30; ui.wrong = 0; ui.msg = "" end
         end
       end
@@ -1127,14 +1618,22 @@ local function handleHit(h, tx, ty)
     return
   end
 
-  -- header
-  if id == "tab" then ui.tab = d
+  -- header / drawers
+  if id == "tab" then ui.tab = d; ui.drawer = nil
   elseif id == "lock" then lock()
+  elseif id == "filterbtn" then ui.drawer = (ui.drawer == "filter") and nil or "filter"
+  elseif id == "menubtn" then ui.drawer = (ui.drawer == "heat") and nil or "heat"
+  elseif id == "drawerclose" then ui.drawer = nil
+
+  -- system
+  elseif id == "syssave" then saveNow()
+  elseif id == "sysdebug" then writeDebug(next(data.players))
 
   -- tracking
-  elseif id == "trkrow" then trk.sel = d
-  elseif id == "trkup" then trk.scroll = math.max(0, trk.scroll - 6)
-  elseif id == "trkdn" then trk.scroll = trk.scroll + 6
+  elseif id == "trkrow" then trk.sel = (trk.sel == d) and nil or d
+  elseif id == "detclose" then trk.sel = nil
+  elseif id == "trkscroll" then
+    scrollTo(id, ty, function() trk.scroll = max(0, trk.scroll - 6) end, function() trk.scroll = trk.scroll + 6 end)
   elseif id == "trkheat" then
     if trk.sel and data.heat[trk.sel] and #data.heat[trk.sel] > 0 then
       hm.player = trk.sel; hm.tp = nil; hm.follow = true; hm.dim = nil; hm.playing = false
@@ -1148,7 +1647,22 @@ local function handleHit(h, tx, ty)
     end
 
   -- chat
-  elseif id == "fuser" then ui.modal = { type = "users", page = 1 }
+  elseif id == "cmsg" then cs.sel[d] = (not cs.sel[d]) or nil
+  elseif id == "chatscroll" then
+    scrollTo(id, ty, function() cs.scroll = cs.scroll + 12 end, function() cs.scroll = max(0, cs.scroll - 12) end)
+  elseif id == "cclear" then cs.sel = {}
+  elseif id == "cdelsel" then
+    local n, set = 0, {}
+    for e in pairs(cs.sel) do set[e] = true; n = n + 1 end
+    if n > 0 then confirm("Delete the " .. n .. " selected message(s) from history?", function() deleteChat(set) end) end
+  elseif id == "cdelall" then
+    local set, n = {}, #cs.filtered
+    for _, e in ipairs(cs.filtered) do set[e] = true end
+    if n > 0 then
+      ui.drawer = nil
+      confirm("Delete all " .. n .. " messages currently shown by the filters?", function() deleteChat(set) end)
+    end
+  elseif id == "fuser" then openUserPicker()
   elseif id == "fday" then cs.day = cycle(cs.day, #DAYS); bumpFilter()
   elseif id == "ftime" then cs.time = cycle(cs.time, #TIMES); bumpFilter()
   elseif id == "flen" then cs.len = cycle(cs.len, #LENS); bumpFilter()
@@ -1156,41 +1670,23 @@ local function handleHit(h, tx, ty)
   elseif id == "fsearch" then ui.modal = { type = "kbd", buf = cs.q, title = "SEARCH CHAT MESSAGES" }
   elseif id == "freset" then
     cs.users = {}; cs.day = 1; cs.time = 1; cs.len = 1; cs.events = true; cs.q = ""; bumpFilter()
-  elseif id == "cmsg" then cs.sel[d] = (not cs.sel[d]) or nil
-  elseif id == "cup" then cs.scroll = cs.scroll + 8
-  elseif id == "cdn" then cs.scroll = math.max(0, cs.scroll - 8)
-  elseif id == "ctop" then cs.scroll = 1e9
-  elseif id == "cbot" then cs.scroll = 0
-  elseif id == "cdelsel" then
-    local n = 0
-    local set = {}
-    for e in pairs(cs.sel) do set[e] = true; n = n + 1 end
-    if n > 0 then confirm("Delete the " .. n .. " selected message(s) from history?", function() deleteChat(set) end) end
-  elseif id == "cdelall" then
-    local set, n = {}, #cs.filtered
-    for _, e in ipairs(cs.filtered) do set[e] = true end
-    if n > 0 then confirm("Delete all " .. n .. " messages currently shown by the filters?", function() deleteChat(set) end) end
 
   -- heatmap
-  elseif id == "hprev" or id == "hnext" then
-    local list = heatPlayers()
-    if #list > 0 then
-      local i = 1
-      for k, n in ipairs(list) do if n == hm.player then i = k end end
-      i = i + (id == "hnext" and 1 or -1)
-      if i < 1 then i = #list elseif i > #list then i = 1 end
-      hm.player = list[i]; hm.tp = nil; hm.follow = true; hm.dim = nil; hm.playing = false
-    end
-  elseif id == "hdim" then
+  elseif id == "hmplayer" then openHeatPicker()
+  elseif id == "hmdim" then
     local s = hm.player and data.heat[hm.player]
     if s then
-      local dims = playerDims(s)
       local opts = { false }
-      for _, v in ipairs(dims) do opts[#opts + 1] = v end
+      for _, v in ipairs(playerDims(s)) do opts[#opts + 1] = v end
       local cur = 1
       for i, v in ipairs(opts) do if v == (hm.dim or false) then cur = i end end
-      local nxt = opts[(cur % #opts) + 1]
-      hm.dim = nxt or nil
+      hm.dim = opts[(cur % #opts) + 1] or nil
+    end
+  elseif id == "hmdel" then
+    local name = hm.player
+    if name then
+      ui.drawer = nil
+      confirm("Delete the entire heatmap history for " .. name .. "?", function() deleteHeat(name) end)
     end
   elseif id == "hplay" then
     local s = hm.player and data.heat[hm.player]
@@ -1222,26 +1718,33 @@ local function handleHit(h, tx, ty)
   elseif id == "hstart" then
     local s = hm.player and data.heat[hm.player]
     if s and #s > 0 then hm.tp = s[1][1]; hm.follow = false; hm.playing = false end
-  elseif id == "hend" then
-    hm.follow = true; hm.playing = false
+  elseif id == "hend" then hm.follow = true; hm.playing = false
   elseif id == "hseek" then
     local s = hm.player and data.heat[hm.player]
     if s and #s > 0 then
-      local frac = clamp((tx - h.x) / math.max(1, h.w - 1), 0, 1)
+      local frac = clamp((tx - h.x) / max(1, h.w - 1), 0, 1)
       local t0, tN = s[1][1], s[#s][1]
       hm.tp = t0 + frac * (tN - t0)
       hm.follow = false
     end
-  elseif id == "hdel" then
-    local name = hm.player
-    if name then
-      confirm("Delete the entire heatmap history for " .. name .. "?", function() deleteHeat(name) end)
-    end
   end
 end
 
-local function onTouch(tx, ty)
+-- monitor_touch may report character cells or raw pixels depending on the
+-- CC: Graphics version. "auto" starts with chars and latches to pixels the
+-- first time a touch lands outside the character grid.
+local touchPixels = (CONFIG.TOUCH_MODE == "pixel")
+local function touchToPx(cx, cy)
+  if CONFIG.TOUCH_MODE == "auto" and not touchPixels and (cx > W or cy > H) then touchPixels = true end
+  if touchPixels then return cx, cy end
+  return (cx - 0.5) * PXW / W, (cy - 0.5) * PXH / H
+end
+
+local function onTouch(cx, cy)
   if not ui.locked then ui.lastAct = now() end
+  local tx, ty = touchToPx(cx, cy)
+  diag.touch = string.format("event %s,%s -> px %d,%d (%s)", tostring(cx), tostring(cy), floor(tx), floor(ty),
+                             touchPixels and "pixel mode" or "char mode")
   for i = #hits, 1, -1 do
     local h = hits[i]
     if tx >= h.x and tx < h.x + h.w and ty >= h.y and ty < h.y + h.h then
@@ -1259,7 +1762,7 @@ local function frame()
   local s = hm.player and data.heat[hm.player]
   if not s or #s == 0 then hm.playing = false; return end
   local t0, tN = s[1][1], s[#s][1]
-  local span = math.max(tN - t0, 60)
+  local span = max(tN - t0, 60)
   hm.tp = (hm.tp or tN) + hm.rate * span / 30 * dt
   if hm.rate > 0 and hm.tp >= tN then hm.tp = tN; hm.playing = false; hm.follow = true
   elseif hm.rate < 0 and hm.tp <= t0 then hm.tp = t0; hm.playing = false end
@@ -1268,29 +1771,29 @@ end
 --------------------------------------------------------------------
 -- MAIN
 --------------------------------------------------------------------
+local function safePoll()
+  local ok, err = pcall(poll)
+  if not ok then diag.err = "poll: " .. tostring(err); logErr("poll: " .. tostring(err)) end
+end
+
 local function main()
   loadData()
-  poll()
+  safePoll()
   startup = false
   saveNow()
   local tickT = os.startTimer(1)
   local frameT
   local tick = 0
-  render()
 
-  while true do
-    local ev = { os.pullEventRaw() }
+  local function handle(ev)
     local e = ev[1]
-    local redraw = false
+    local redraw, heatOnly = false, false
 
-    if e == "terminate" then
-      break
-
-    elseif e == "monitor_touch" and ev[2] == monName then
+    if e == "monitor_touch" and ev[2] == monName then
       onTouch(ev[3], ev[4]); redraw = true
 
     elseif e == "chat" then
-      -- chat_box event: username, message, uuid, isHidden
+      diag.chatN = diag.chatN + 1; diag.chatLast = now()
       if ev[2] and ev[3] then
         logEvent("c", ev[2], ev[3])
         ensurePlayer(ev[2])
@@ -1327,30 +1830,50 @@ local function main()
       if ev[2] == tickT then
         tickT = os.startTimer(1)
         tick = tick + 1
-        if tick % CONFIG.POLL_EVERY == 0 then poll() end
-        if not ui.locked and now() - ui.lastAct >= CONFIG.LOCK_AFTER then lock() end
-        if dirty and now() - lastSave >= CONFIG.SAVE_EVERY then saveNow() end
-        redraw = true
+        local polled = false
+        if tick % CONFIG.POLL_EVERY == 0 then safePoll(); polled = true end
+        if not ui.locked and now() - ui.lastAct >= CONFIG.LOCK_AFTER then lock(); redraw = true end
+        if dirty and now() - lastTry >= CONFIG.SAVE_EVERY then saveNow() end
+        if polled and not ui.modal and not (ui.tab == "heat" and hm.playing) then redraw = true end
+        if not polled and ui.tab == "sys" and not ui.locked and not ui.modal then redraw = true end
       elseif ev[2] == frameT then
         frameT = nil
         frame()
-        redraw = true
+        heatOnly = true
       end
     end
 
     if hm.playing and not frameT and not ui.locked and ui.tab == "heat" then
       hm.last = hm.last or (os.epoch("utc") / 1000)
-      frameT = os.startTimer(0.1)
+      frameT = os.startTimer(0.15)
     end
-    if redraw then render() end
+    if redraw then render()
+    elseif heatOnly then renderHeatFrame() end
+  end
+
+  render()
+  while true do
+    local ev = { os.pullEventRaw() }
+    if ev[1] == "terminate" then break end
+    local ok, err = pcall(handle, ev)
+    if not ok then
+      logErr("event " .. tostring(ev[1]) .. ": " .. tostring(err))
+      pcall(render)
+    end
   end
 
   saveNow()
 end
 
 local ok, err = pcall(main)
+pcall(function() mon.setGraphicsMode(0) end)
 pcall(function() mon.setBackgroundColor(colors.black); mon.clear() end)
-restorePalette(mon)
+pcall(function()
+  for c = 0, 15 do
+    local col = 2 ^ c
+    mon.setPaletteColor(col, term.nativePaletteColor(col))
+  end
+end)
 if not ok then
   pcall(saveNow)
   error(err, 0)
