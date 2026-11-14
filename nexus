@@ -1,26 +1,29 @@
 --=====================================================================
---  NEXUS TRACKER  v2.0   -  black & orange pixel UI
+--  NEXUS TRACKER  v2.3   -  black & orange pixel UI
 --  CC:Tweaked + Advanced Peripherals + CC: Graphics  (NeoForge 1.21.1)
 --
 --  Needs: Advanced Monitor (6x3), Chat Box, Player Detector, NBT Storage
 --  Run:   nexus        (or save as startup.lua)
---  Debug: writes "nexus_debug.txt" on start (detector methods + raw data)
+--  Debug: SYSTEM tab shows live diagnostics. Files written on the computer:
+--         nexus_debug.txt (detector methods + raw data), nexus_error.txt (errors)
 --=====================================================================
 
 local CONFIG = {
-  PIN            = "4212",
+  PIN            = "421299", -- 6 digits
   LOCK_AFTER     = 180,      -- seconds idle before auto-lock
   TEXT_SCALE     = 0.5,      -- monitor text scale (sets pixel resolution)
   GFX_MODE       = 2,        -- CC: Graphics mode (2 = 256 colours)
   CUSTOM_PALETTE = true,     -- set false to use the default CC palette
-  HEAT_PX        = 2,        -- screen pixels per heatmap pixel
+  TOUCH_MODE     = "auto",   -- "auto", "chars" or "pixel" (what monitor_touch reports)
+  HEAT_PX        = 1,        -- screen pixels per heatmap pixel (1 = sharpest)
   POLL_EVERY     = 2,        -- seconds between position polls
   SAMPLE_EVERY   = 5,        -- seconds between heatmap samples (moving)
   SAVE_EVERY     = 20,
-  NBT_BUDGET     = 15000,    -- bytes written to NBT Storage
+  NBT_BUDGET     = 15000,    -- bytes written to NBT Storage (auto-shrinks if refused)
   LOCAL_MIRROR   = true,     -- full uncapped copy on the computer disk
   LOCAL_FILE     = "nexus_data.json",
   DEBUG_FILE     = "nexus_debug.txt",
+  ERROR_FILE     = "nexus_error.txt",
   MAX_CHAT       = 5000,
   MAX_HEAT       = 20000,
 }
@@ -48,6 +51,18 @@ local function fmtDur(s)
   return floor(s / 3600) .. "h " .. floor((s % 3600) / 60) .. "m"
 end
 
+-- diagnostics (shown on the SYSTEM tab, nothing fails silently any more)
+local diag = { ok = 0, fail = 0, n = 0, how = "", err = "", lastErr = "", raw = "-",
+               chatN = 0, chatLast = 0, touch = "-", saveErr = "", nbtErr = "",
+               methods = "?", localBytes = 0, nbtMethods = "?", nbtWriter = "", chatRaw = "-" }
+local function logErr(s)
+  s = sanitize(s)
+  if diag.lastErr == s then return end
+  diag.lastErr = s
+  local f = fs.open("nexus_error.txt", "a")
+  if f then f.writeLine(os.date("%m/%d %H:%M:%S", now()) .. "  " .. s); f.close() end
+end
+
 --------------------------------------------------------------------
 -- peripherals
 --------------------------------------------------------------------
@@ -72,6 +87,19 @@ if type(mon.setGraphicsMode) ~= "function" or type(mon.drawPixels) ~= "function"
   error("This monitor has no graphics API. Install CC: Graphics (0.2+ with monitor support).", 0)
 end
 local monName = peripheral.getName(mon)
+do
+  local ok, m = pcall(peripheral.getMethods, peripheral.getName(detector))
+  if ok and type(m) == "table" then diag.methods = table.concat(m, ", ") end
+end
+
+local nbtName, nbtNoWrite = nbt and peripheral.getName(nbt) or "none", true
+if nbt then
+  local ok, m = pcall(peripheral.getMethods, nbtName)
+  if ok and type(m) == "table" then
+    diag.nbtMethods = table.concat(m, ", ")
+    for _, n in ipairs(m) do if n:match("^write") then nbtNoWrite = false end end
+  end
+end
 
 mon.setTextScale(CONFIG.TEXT_SCALE)
 local W, H = mon.getSize()
@@ -109,23 +137,77 @@ end
 if not palOK then for k, v in pairs(FALLBACK) do COL[k] = v end end
 local K0, K1, K2, K3, G1, G2, WH = COL.K0, COL.K1, COL.K2, COL.K3, COL.G1, COL.G2, COL.WH
 local O1, O2, O3, O4, O5, O6, RD, YL = COL.O1, COL.O2, COL.O3, COL.O4, COL.O5, COL.O6, COL.RD, COL.YL
-local HEATC = { O1, O2, O3, O4, O5, O6 }
+local HEATC = { O2, O3, O4, O5, O6 }
 
 --------------------------------------------------------------------
 -- pixel backend
 --------------------------------------------------------------------
 local ROWSTR = pcall(mon.drawPixels, 0, 0, { string.char(K0) })
+local function freeze(b) pcall(mon.setFrozen, b) end
+
+-- Off-screen framebuffer. Everything draws into FB (pure Lua, instant), then
+-- commit() pushes only the rows that changed in one or two drawPixels calls.
+-- The old version made hundreds of monitor calls per redraw, which is what
+-- made taps feel laggy and unresponsive.
+local FB, SHOWN = {}, {}
+do
+  local blank = string.rep(string.char(K0), PXW)
+  for r = 1, PXH do FB[r] = blank end
+end
+
 local function put(x, y, rows)
-  if not ROWSTR then
-    for i = 1, #rows do
-      local s, t = rows[i], {}
-      for j = 1, #s do t[j] = s:byte(j) end
-      rows[i] = t
+  x, y = floor(x), floor(y)
+  for i = 1, #rows do
+    local yy = y + i
+    if yy >= 1 and yy <= PXH then
+      local str = rows[i]
+      local x0 = x
+      if x0 < 0 then str = str:sub(1 - x0); x0 = 0 end
+      if x0 + #str > PXW then str = str:sub(1, PXW - x0) end
+      local len = #str
+      if len > 0 then
+        if x0 == 0 and len >= PXW then FB[yy] = str
+        else FB[yy] = FB[yy]:sub(1, x0) .. str .. FB[yy]:sub(x0 + len + 1) end
+      end
     end
   end
-  mon.drawPixels(x, y, rows)
 end
-local function freeze(b) pcall(mon.setFrozen, b) end
+
+local function sendRows(first, last)
+  local rows = {}
+  for r = first, last do
+    local str = FB[r]
+    if ROWSTR then rows[#rows + 1] = str
+    else
+      local t = {}
+      for j = 1, #str do t[j] = str:byte(j) end
+      rows[#rows + 1] = t
+    end
+  end
+  mon.drawPixels(0, first - 1, rows)
+end
+
+local function commit()
+  freeze(true)
+  local r = 1
+  while r <= PXH do
+    if FB[r] ~= SHOWN[r] then
+      local last, gap, q = r, 0, r + 1
+      while q <= PXH do               -- bridge tiny unchanged gaps to save calls
+        if FB[q] ~= SHOWN[q] then last = q; gap = 0
+        else gap = gap + 1; if gap > 6 then break end end
+        q = q + 1
+      end
+      local ok, err = pcall(sendRows, r, last)
+      if not ok then logErr("drawPixels: " .. tostring(err)) end
+      for k = r, last do SHOWN[k] = FB[k] end
+      r = last + 1
+    else
+      r = r + 1
+    end
+  end
+  freeze(false)
+end
 
 local function rect(x, y, w, h, c)
   x, y, w, h = floor(x), floor(y), floor(w), floor(h)
@@ -134,9 +216,9 @@ local function rect(x, y, w, h, c)
   if x + w > PXW then w = PXW - x end
   if y + h > PXH then h = PXH - y end
   if w <= 0 or h <= 0 then return end
-  local s = string.rep(string.char(c), w)
+  local str = string.rep(string.char(c), w)
   local rows = {}
-  for i = 1, h do rows[i] = s end
+  for i = 1, h do rows[i] = str end
   put(x, y, rows)
 end
 
@@ -377,7 +459,8 @@ end
 --------------------------------------------------------------------
 local data = { v = 1, players = {}, chat = {}, heat = {}, dims = {}, saved = 0 }
 local dirty, chatVer, startup = false, 0, true
-local lastSave, lastSaveBytes, nbtOK = 0, 0, true
+local lastSave, lastTry, lastSaveBytes, nbtOK = 0, 0, 0, true
+local nbtBudget = CONFIG.NBT_BUDGET
 
 local function dimId(name)
   name = name or "minecraft:overworld"
@@ -394,39 +477,106 @@ local function dimShort(i)
   return (s:gsub("^%l", string.upper))
 end
 
-local function payload(f)
-  local out = { v = 1, saved = data.saved, dims = data.dims, players = data.players, chat = {}, heat = {} }
-  local nc = #data.chat
-  for i = nc - floor(nc * f) + 1, nc do out.chat[#out.chat + 1] = data.chat[i] end
-  for name, s in pairs(data.heat) do
-    local ns, arr = #s, {}
-    for i = ns - floor(ns * f) + 1, ns do arr[#arr + 1] = s[i] end
-    out.heat[name] = arr
+local function jstr(v) return '"' .. (tostring(v):gsub('[\\"]', '\\%0')) .. '"' end
+
+-- hand-rolled JSON writer: textutils.serialiseJSON is far too slow for thousands
+-- of heatmap samples (it could trip "too long without yielding")
+local function encode(f)
+  local parts = { '{"v":1,"saved":', tostring(floor(data.saved or 0)), ',"dims":', textutils.serialiseJSON(data.dims),
+                  ',"players":', textutils.serialiseJSON(data.players), ',"chat":[' }
+  local nc, c = #data.chat, {}
+  for i = nc - floor(nc * f) + 1, nc do
+    local e = data.chat[i]
+    c[#c + 1] = string.format("[%d,%s,%s,%s]", floor(e[1]), jstr(e[2]), jstr(e[3]), jstr(e[4]))
   end
-  return out
+  parts[#parts + 1] = table.concat(c, ",")
+  parts[#parts + 1] = '],"heat":{'
+  local hh = {}
+  for name, sm in pairs(data.heat) do
+    local ns, r = #sm, {}
+    for i = ns - floor(ns * f) + 1, ns do
+      local e = sm[i]
+      r[#r + 1] = string.format("[%d,%d,%d,%d]", floor(e[1]), floor(e[2]), floor(e[3]), floor(e[4]))
+    end
+    hh[#hh + 1] = jstr(name) .. ":[" .. table.concat(r, ",") .. "]"
+  end
+  parts[#parts + 1] = table.concat(hh, ",")
+  parts[#parts + 1] = "}}"
+  return table.concat(parts)
 end
 
-local function saveNow()
+-- NBT Storage access that adapts to whatever methods the peripheral really has
+local function nbtWrite(t)
+  local errs, tried = {}, {}
+  local function try(name, arg)
+    if tried[name] then return false end
+    tried[name] = true
+    local fn = nbt[name]
+    if type(fn) ~= "function" then return false end
+    local ok, res, msg = pcall(fn, arg)
+    if ok and res ~= false and type(res) ~= "string" and msg == nil then diag.nbtWriter = name; return true end
+    errs[#errs + 1] = name .. ": " .. tostring(ok and (msg or res) or res)
+    return false
+  end
+  if diag.nbtWriter == "writeJson" and try("writeJson", textutils.serialiseJSON(t)) then return true end
+  if try("writeTable", t) then return true end
+  if try("writeJson", textutils.serialiseJSON(t)) then return true end
+  for name, fn in pairs(nbt) do
+    if type(fn) == "function" and name:match("^write") and try(name, t) then return true end
+  end
+  if #errs == 0 then errs[1] = "no write method" end
+  return false, table.concat(errs, " | ")
+end
+
+local function nbtRead()
+  for _, name in ipairs({ "read", "readTable", "get" }) do
+    local fn = nbt[name]
+    if type(fn) == "function" then
+      local ok, t = pcall(fn)
+      if ok and type(t) == "table" then return t end
+    end
+  end
+end
+
+local function saveInner()
   data.saved = now()
+  diag.saveErr = ""
+  local full = encode(1)
   if CONFIG.LOCAL_MIRROR then
     local f = fs.open(CONFIG.LOCAL_FILE, "w")
-    if f then f.write(textutils.serialiseJSON(data)); f.close() end
+    if f then f.write(full); f.close(); diag.localBytes = #full
+    else diag.saveErr = "cannot write " .. CONFIG.LOCAL_FILE end
   end
-  if nbt then
-    local f, pj = 1.0, nil
-    while true do
-      pj = textutils.serialiseJSON(payload(f))
-      if #pj <= CONFIG.NBT_BUDGET or f < 0.02 then break end
-      f = f * 0.8
+  if nbt and nbtNoWrite then
+    nbtOK = false
+    diag.nbtErr = "peripheral '" .. nbtName .. "' has no write method"
+  elseif nbt then
+    for _ = 1, 5 do
+      local f = 1.0
+      if #full > nbtBudget then f = nbtBudget / #full * 0.95 end
+      local pj = (f >= 1) and full or encode(f)
+      while #pj > nbtBudget and f > 0.02 do f = f * 0.85; pj = encode(f) end
+      local t, n = {}, 0
+      for i = 1, #pj, 30000 do n = n + 1; t["c" .. n] = pj:sub(i, i + 29999) end
+      t.n = n
+      local ok, err = nbtWrite(t)
+      if ok then
+        nbtOK = true; diag.nbtErr = ""; lastSaveBytes = #pj
+        break
+      end
+      -- the NBT Storage refused it (too big?) - shrink the budget and retry
+      nbtOK = false
+      diag.nbtErr = tostring(err)
+      nbtBudget = max(1000, floor(nbtBudget * 0.7))
     end
-    local t, n = {}, 0
-    for i = 1, #pj, 30000 do n = n + 1; t["c" .. n] = pj:sub(i, i + 29999) end
-    t.n = n
-    nbtOK = pcall(nbt.writeTable, t)
-    lastSaveBytes = #pj
   end
   dirty = false
   lastSave = now()
+end
+local function saveNow()
+  lastTry = now()
+  local ok, err = pcall(saveInner)
+  if not ok then diag.saveErr = tostring(err); logErr("save: " .. tostring(err)) end
 end
 
 local function decode(json)
@@ -442,8 +592,8 @@ local function loadData()
     if f then best = decode(f.readAll()); f.close() end
   end
   if nbt then
-    local ok, t = pcall(nbt.read)
-    if ok and type(t) == "table" and t.n then
+    local t = nbtRead()
+    if type(t) == "table" and t.n then
       local parts = {}
       for i = 1, t.n do parts[#parts + 1] = t["c" .. i] or "" end
       local d = decode(table.concat(parts))
@@ -456,6 +606,16 @@ local function loadData()
   data.heat = data.heat or {}
   data.dims = data.dims or {}
   for _, p in pairs(data.players) do p.online = false end
+  -- repair: v2.0/2.1 mis-parsed chat events and stored UUIDs as player names
+  local uu = "^%x+%-%x+%-%x+%-%x+%-%x+$"
+  local clean = {}
+  for _, e in ipairs(data.chat) do
+    if not tostring(e[3]):match(uu) then clean[#clean + 1] = e end
+  end
+  data.chat = clean
+  for name in pairs(data.players) do
+    if tostring(name):match(uu) then data.players[name] = nil; data.heat[name] = nil end
+  end
 end
 
 --------------------------------------------------------------------
@@ -475,6 +635,7 @@ local function ensurePlayer(name)
   if not p then
     p = { online = false, first = now(), seen = now(), x = 0, y = 0, z = 0, dim = dimId(), pos = false }
     data.players[name] = p
+    dirty = true
   end
   return p
 end
@@ -517,7 +678,13 @@ local function addSample(name, p, force)
 end
 
 -- position reading with diagnostics --------------------------------
-local diag = { ok = 0, fail = 0, how = "", err = "" }
+local function rawStr(v)
+  if v == nil then return "nil" end
+  local ok, s = pcall(textutils.serialise, v, { compact = true })
+  if not ok then s = tostring(v) end
+  return sanitize(s):sub(1, 400)
+end
+
 local function readPos(name)
   local lastRaw
   for _, fname in ipairs({ "getPlayerPos", "getPlayer" }) do
@@ -525,15 +692,19 @@ local function readPos(name)
     if type(fn) == "function" then
       local ok, res = pcall(fn, name)
       if ok and type(res) == "table" then
-        local x, y, z = res.x, res.y, res.z
+        local x, y, z = res.x or res.X or res.posX, res.y or res.Y or res.posY, res.z or res.Z or res.posZ
         if not x and type(res.pos) == "table" then x, y, z = res.pos.x, res.pos.y, res.pos.z end
         if not x and type(res.position) == "table" then x, y, z = res.position.x, res.position.y, res.position.z end
+        x, z = tonumber(x), tonumber(z)
         if x and z then
-          return { x = x, y = y or 0, z = z, dimension = res.dimension or res.dim }, fname, res
+          return { x = x, y = tonumber(y) or 0, z = z, dimension = res.dimension or res.dim }, fname, res
         end
         lastRaw = res
       elseif not ok then
-        diag.err = tostring(res)
+        diag.err = fname .. ": " .. tostring(res)
+        lastRaw = tostring(res)
+      else
+        lastRaw = res
       end
     end
   end
@@ -546,31 +717,52 @@ local function writeDebug(name)
   f.writeLine("NEXUS debug  " .. os.date("%Y-%m-%d %H:%M:%S", now()))
   f.writeLine("pixel size: " .. PXW .. "x" .. PXH .. "  chars: " .. W .. "x" .. H)
   f.writeLine("custom palette: " .. tostring(palOK) .. "   string rows: " .. tostring(ROWSTR))
-  local ok, m = pcall(peripheral.getMethods, peripheral.getName(detector))
-  f.writeLine("detector methods: " .. (ok and table.concat(m, ", ") or "?"))
+  f.writeLine("detector methods: " .. diag.methods)
+  f.writeLine("chat box: " .. tostring(chatBox ~= nil) .. "  nbt storage: " .. tostring(nbt ~= nil))
+  f.writeLine("last touch: " .. diag.touch)
+  f.writeLine("nbt: " .. nbtName .. " methods: " .. diag.nbtMethods .. "  error: " .. diag.nbtErr)
+  f.writeLine("last chat event: " .. diag.chatRaw)
   if name then
     local pos, how, raw = readPos(name)
     f.writeLine("sample player: " .. name)
     f.writeLine("method used: " .. tostring(how))
-    f.writeLine("raw result: " .. textutils.serialise(pos or raw or "nil/empty"))
-    f.writeLine("last error: " .. diag.err)
+    f.writeLine("raw result: " .. rawStr(pos or raw))
   end
+  f.writeLine("last detector error: " .. diag.err)
+  f.writeLine("last error: " .. diag.lastErr)
   f.close()
 end
 
 local debugDone = false
-local function poll()
+
+local function listPlayers()
   local ok, list = pcall(detector.getOnlinePlayers)
-  if not ok or type(list) ~= "table" then
-    diag.err = "getOnlinePlayers failed: " .. tostring(list)
-    return
+  if not ok then diag.err = "getOnlinePlayers: " .. tostring(list); return nil end
+  if type(list) ~= "table" then diag.err = "getOnlinePlayers returned " .. type(list); return nil end
+  local out = {}
+  for _, v in pairs(list) do
+    if type(v) == "string" then out[#out + 1] = v
+    elseif type(v) == "table" then
+      local n = v.name or v.username or v.player
+      if n then out[#out + 1] = tostring(n) end
+    end
   end
+  table.sort(out)
+  return out
+end
+
+local function poll()
+  local names = listPlayers()
+  if not names then diag.n = 0; diag.ok, diag.fail = 0, 0; return end
+  diag.err = ""
+  diag.n = #names
   local set, okc, failc = {}, 0, 0
-  for _, name in ipairs(list) do
+  for i, name in ipairs(names) do
     set[name] = true
     setOnline(name)
     local p = data.players[name]
-    local pos, how = readPos(name)
+    local pos, how, raw = readPos(name)
+    if i == 1 then diag.raw = name .. " = " .. rawStr(pos and raw or raw) end
     if pos then
       okc = okc + 1
       p.x, p.y, p.z = floor(pos.x), floor(pos.y), floor(pos.z)
@@ -646,7 +838,7 @@ local function scrollbar(id, x, y, h, total, vis, pos)
     ty = y + floor((h - th) * clamp(pos, 0, total - vis) / (total - vis))
   end
   rect(x, ty, 5, th, O3)
-  SB[id] = { y = y, h = h, ty = ty, th = th }
+  SB[id] = { y = y, h = h, ty = ty, th = th, total = total, vis = vis }
   addHit(id, x - 16, y, 38, h)
 end
 
@@ -751,8 +943,11 @@ local function drawLock()
   local cx = floor(PXW / 2)
   ctext(0, PXW, 22, "NEXUS", O4, K0, 3)
   ctext(0, PXW, 54, "SECURE ACCESS TERMINAL", G1, K0, 1)
-  for i = 1, 4 do
-    local dx = cx - 51 + (i - 1) * 28
+  local np = #CONFIG.PIN
+  local step = 24
+  local startX = cx - floor((np * step - 10) / 2)
+  for i = 1, np do
+    local dx = startX + (i - 1) * step
     rect(dx, 76, 14, 14, i <= #ui.pin and O4 or K3)
     if i > #ui.pin then rect(dx + 1, 77, 12, 12, K0) end
   end
@@ -843,14 +1038,17 @@ local function drawTracking()
       text(cCoord, ry + 15, p.online and (p.stale and "last known" or "live") or ("last seen " .. fmtDT(p.seen)), G1, bg, 1)
     else
       text(cCoord, ry + 4, "NO SIGNAL", G1, bg, 1)
-      text(cCoord, ry + 15, "no position data yet", K3, bg, 1)
+      text(cCoord, ry + 15, "see SYSTEM tab", K3, bg, 1)
     end
     text(cDim, ry + 4, p.pos and dimShort(p.dim) or "-", p.pos and O5 or G1, bg, 1)
     text(cStat, ry + 4, p.online and "ONLINE" or "OFFLINE", p.online and O4 or G1, bg, 1)
     text(cStat, ry + 15, "since " .. fmtDT(p.first), G1, bg, 1)
     addHit("trkrow", lx, ry, lw, rowH - 2, name)
   end
-  if #names == 0 then ctext(lx, lw, top + 60, "NO PLAYERS RECORDED YET", G1, K0, 1) end
+  if #names == 0 then
+    ctext(lx, lw, top + 50, "NO PLAYERS RECORDED YET", G1, K0, 1)
+    ctext(lx, lw, top + 66, diag.err ~= "" and fit("DETECTOR: " .. diag.err, lw - 20, 1) or "open the SYSTEM tab to check the detector", diag.err ~= "" and RD or K3, K0, 1)
+  end
   scrollbar("trkscroll", rb - 6, top, CY1 - top, #names, rowsVis, trk.scroll)
 
   if selP then
@@ -876,7 +1074,7 @@ local function drawTracking()
       text(dx + 14, dy + 160, dimShort(selP.dim), O5, K1)
     else
       text(dx + 14, dy + 82, "NO SIGNAL", RD, K1)
-      text(dx + 14, dy + 96, "see nexus_debug.txt", G1, K1)
+      text(dx + 14, dy + 96, "see SYSTEM tab", G1, K1)
     end
     text(dx + 14, dy + 180, "FIRST SEEN", G1, K1); text(dx + 100, dy + 180, fmtDT(selP.first), G2, K1)
     text(dx + 14, dy + 192, "LAST SEEN", G1, K1);  text(dx + 100, dy + 192, fmtDT(selP.seen), G2, K1)
@@ -906,7 +1104,8 @@ local function drawChat()
   local info = #cs.filtered .. " of " .. #data.chat .. " messages"
   local nf = activeFilterCount()
   if nf > 0 then info = info .. "   |   " .. nf .. " filter" .. (nf > 1 and "s" or "") .. " active" end
-  text(lx, CY0, info, G1, K0)
+  if not chatBox then info = info .. "   |   NO CHAT BOX CONNECTED" end
+  text(lx, CY0, info, chatBox and G1 or RD, K0)
   rect(lx, CY0 + 12, rb - lx, 1, K3)
 
   local nsel = 0
@@ -971,63 +1170,86 @@ end
 
 local STEPS = { 16, 32, 50, 100, 200, 250, 500, 1000, 2000, 5000, 10000, 50000 }
 
-local function buildHeat(s, tp, dimSel, PW, PH)
-  local n = #s
-  local lo, hi, idx = 1, n, 0
+local function sampleIndex(s, tp)          -- last sample whose time <= tp
+  local lo, hi, idx = 1, #s, 0
   while lo <= hi do
     local mid = floor((lo + hi) / 2)
     if s[mid][1] <= tp then idx = mid; lo = mid + 1 else hi = mid - 1 end
   end
+  return idx
+end
+
+local function nice(v)                       -- stepped sizes so the view only re-scales now and then
+  local n = 64
+  while n < v do n = n * 1.25 end
+  return floor(n)
+end
+
+local ACT = {}
+local function activeDuration(s)             -- tracked time excluding long idle gaps
+  if ACT.s == s and ACT.n == #s then return ACT.dur end
+  local d = 0
+  for i = 2, #s do
+    local g = s[i][1] - s[i - 1][1]
+    if g <= 45 then d = d + g end
+  end
+  ACT = { s = s, n = #s, dur = d }
+  return d
+end
+
+local HB, HC = {}, {}    -- bounds cache, accumulated heat cache (both incremental)
+
+local function buildHeat(s, tp, dimSel, PW, PH)
+  local idx = sampleIndex(s, tp)
   if idx == 0 then return nil end
   local dim = dimSel or s[idx][4]
-  local minX, maxX, minZ, maxZ, count = math.huge, -math.huge, math.huge, -math.huge, 0
-  for i = 1, idx do
+
+  -- bounds of everything up to the playhead (incremental)
+  if HB.s ~= s or HB.dim ~= dim or idx < HB.n then
+    HB = { s = s, dim = dim, n = 0, minX = math.huge, maxX = -math.huge,
+           minZ = math.huge, maxZ = -math.huge, count = 0 }
+  end
+  for i = HB.n + 1, idx do
     local e = s[i]
     if e[4] == dim then
-      count = count + 1
-      if e[2] < minX then minX = e[2] end
-      if e[2] > maxX then maxX = e[2] end
-      if e[3] < minZ then minZ = e[3] end
-      if e[3] > maxZ then maxZ = e[3] end
+      HB.count = HB.count + 1
+      if e[2] < HB.minX then HB.minX = e[2] end
+      if e[2] > HB.maxX then HB.maxX = e[2] end
+      if e[3] < HB.minZ then HB.minZ = e[3] end
+      if e[3] > HB.maxZ then HB.maxZ = e[3] end
     end
   end
-  if count == 0 then return { empty = true, dim = dim, idx = idx } end
-  local spanX = max(maxX - minX + 1, 48)
-  local spanZ = max(maxZ - minZ + 1, 48)
+  HB.n = idx
+  if HB.count == 0 then return { empty = true, dim = dim, idx = idx } end
+
+  -- bottom-left = most -X/-Z seen so far; view grows as the player explores
+  local minX = floor(HB.minX / 8) * 8
+  local minZ = floor(HB.minZ / 8) * 8
+  local spanX = nice(HB.maxX - minX + 1)
+  local spanZ = nice(HB.maxZ - minZ + 1)
   local scale = min(PW / spanX, PH / spanZ)
+  local extX, extZ = PW / scale, PH / scale
 
-  local pix = {}
-  -- faint grid
-  local step = STEPS[#STEPS]
-  for _, st in ipairs(STEPS) do if st * scale >= 30 then step = st; break end end
-  local x = math.ceil(minX / step) * step
-  while x <= minX + spanX do
-    local c = floor((x - minX) * scale)
-    if c >= 0 and c < PW then for r = 0, PH - 1 do pix[r * PW + c] = (x == 0) and K3 or K2 end end
-    x = x + step
+  -- accumulate heat incrementally; only rebuilt when the view re-scales or you rewind
+  local key = dim .. ":" .. minX .. ":" .. minZ .. ":" .. scale .. ":" .. PW .. ":" .. PH
+  if HC.s ~= s or HC.key ~= key or idx < HC.idx then
+    HC = { s = s, key = key, idx = 0, g = {}, prev = nil }
   end
-  local z = math.ceil(minZ / step) * step
-  while z <= minZ + spanZ do
-    local r = PH - 1 - floor((z - minZ) * scale)
-    if r >= 0 and r < PH then for c = 0, PW - 1 do pix[r * PW + c] = (z == 0) and K3 or K2 end end
-    z = z + step
-  end
-
-  local g = {}
+  local g = HC.g
   local function add(px, pz, wgt)
     local c = clamp(floor((px - minX) * scale), 0, PW - 1)
     local r = clamp(PH - 1 - floor((pz - minZ) * scale), 0, PH - 1)
     local k = r * PW + c
     g[k] = (g[k] or 0) + wgt
   end
-  local prev
-  for i = 1, idx do
+  local prev = HC.prev
+  for i = HC.idx + 1, idx do
     local e = s[i]
     if e[4] == dim then
       if prev and e[1] - prev[1] <= 120 then
         local dt = min(e[1] - prev[1], 30)
         local steps = max(1, math.ceil(max(math.abs(e[2] - prev[2]), math.abs(e[3] - prev[3])) * scale))
-        steps = min(steps, 400)
+        steps = min(steps, 150)
         local wgt = dt / (steps + 1)
         for k = 0, steps do
           local f = k / steps
@@ -1041,14 +1263,34 @@ local function buildHeat(s, tp, dimSel, PW, PH)
       prev = nil
     end
   end
+  HC.idx, HC.prev = idx, prev
+
+  local pix = {}
+  -- faint coordinate grid (brighter lines at X=0 / Z=0)
+  local step = STEPS[#STEPS]
+  for _, st in ipairs(STEPS) do if st * scale >= 30 then step = st; break end end
+  local x = math.ceil(minX / step) * step
+  while x <= minX + extX do
+    local c = floor((x - minX) * scale)
+    if c >= 0 and c < PW then for r = 0, PH - 1 do pix[r * PW + c] = (x == 0) and K3 or K2 end end
+    x = x + step
+  end
+  local z = math.ceil(minZ / step) * step
+  while z <= minZ + extZ do
+    local r = PH - 1 - floor((z - minZ) * scale)
+    if r >= 0 and r < PH then for c = 0, PW - 1 do pix[r * PW + c] = (z == 0) and K3 or K2 end end
+    z = z + step
+  end
+
+  -- soften + colour by time spent (log scale so rarely visited spots still show)
   local g2, gmax = {}, 0
   for k, v in pairs(g) do
     g2[k] = (g2[k] or 0) + v
     local c = k % PW
-    if c > 0 then g2[k - 1] = (g2[k - 1] or 0) + v * 0.25 end
-    if c < PW - 1 then g2[k + 1] = (g2[k + 1] or 0) + v * 0.25 end
-    if k >= PW then g2[k - PW] = (g2[k - PW] or 0) + v * 0.25 end
-    if k < PW * (PH - 1) then g2[k + PW] = (g2[k + PW] or 0) + v * 0.25 end
+    if c > 0 then g2[k - 1] = (g2[k - 1] or 0) + v * 0.3 end
+    if c < PW - 1 then g2[k + 1] = (g2[k + 1] or 0) + v * 0.3 end
+    if k >= PW then g2[k - PW] = (g2[k - PW] or 0) + v * 0.3 end
+    if k < PW * (PH - 1) then g2[k + PW] = (g2[k + PW] or 0) + v * 0.3 end
   end
   for _, v in pairs(g2) do if v > gmax then gmax = v end end
   local lg = math.log(1 + gmax)
@@ -1056,6 +1298,8 @@ local function buildHeat(s, tp, dimSel, PW, PH)
     local ratio = lg > 0 and (math.log(1 + v) / lg) or 1
     pix[k] = HEATC[clamp(math.ceil(ratio * #HEATC), 1, #HEATC)]
   end
+
+  -- player marker
   local cur = s[idx]
   if cur[4] == dim then
     local mc = clamp(floor((cur[2] - minX) * scale), 0, PW - 1)
@@ -1063,14 +1307,13 @@ local function buildHeat(s, tp, dimSel, PW, PH)
     local function mk(c, r, col)
       if c >= 0 and c < PW and r >= 0 and r < PH then pix[r * PW + c] = col end
     end
-    for d = 2, 3 do
+    for d = 3, 5 do
       mk(mc - d, mr, WH); mk(mc + d, mr, WH); mk(mc, mr - d, WH); mk(mc, mr + d, WH)
     end
-    mk(mc, mr, YL); mk(mc - 1, mr, YL); mk(mc + 1, mr, YL); mk(mc, mr - 1, YL); mk(mc, mr + 1, YL)
+    for d = -1, 1 do mk(mc + d, mr, YL); mk(mc, mr + d, YL) end
   end
   return { pix = pix, idx = idx, dim = dim, minX = minX, minZ = minZ,
-           maxX = minX + spanX - 1, maxZ = minZ + spanZ - 1,
-           spanX = spanX, spanZ = spanZ, scale = scale, cur = cur, step = step }
+           maxX = minX + extX, maxZ = minZ + extZ, scale = scale, cur = cur, step = step }
 end
 
 local HL = {}
@@ -1080,25 +1323,33 @@ local function heatLayout()
   HL.hs = hs
   HL.cx, HL.cy = M, CY0
   HL.PW = floor((PXW - 2 * M) / hs)
-  HL.PH = floor((CY1 - CY0 - 62) / hs)
+  HL.PH = floor((CY1 - CY0 - 64) / hs)
   HL.cw, HL.ch = HL.PW * hs, HL.PH * hs
-  HL.ctrlY = HL.cy + HL.ch + 10
+  HL.ctrlY = HL.cy + HL.ch + 8
 end
 
 local function pushCanvas(res)
   local hs, PW, PH = HL.hs, HL.PW, HL.PH
   local pix = res and res.pix or {}
+  local touched = {}
+  for k in pairs(pix) do touched[floor(k / PW)] = true end
+  local blankRow = string.rep(string.char(K0), PW * hs)
   local rows = {}
   for r = 0, PH - 1 do
-    local t, base = {}, r * PW
-    for c = 0, PW - 1 do
-      local col = pix[base + c] or K0
-      local pc = PIECE[col]
-      if not pc then pc = string.rep(string.char(col), hs); PIECE[col] = pc end
-      t[c + 1] = pc
+    local str
+    if not touched[r] then
+      str = blankRow
+    else
+      local t, base = {}, r * PW
+      for c = 0, PW - 1 do
+        local col = pix[base + c] or K0
+        local pc = PIECE[col]
+        if not pc then pc = string.rep(string.char(col), hs); PIECE[col] = pc end
+        t[c + 1] = pc
+      end
+      str = table.concat(t)
     end
-    local s = table.concat(t)
-    for _ = 1, hs do rows[#rows + 1] = s end
+    for _ = 1, hs do rows[#rows + 1] = str end
   end
   put(HL.cx, HL.cy, rows)
 end
@@ -1107,22 +1358,23 @@ local function heatControls(register)
   local s = hm.player and data.heat[hm.player]
   local y = HL.ctrlY
   local x, w = M, PXW - 2 * M
-  rect(x, y, w, 62, K0)
+  rect(x, y - 4, w, 58, K0)
   -- timeline
   rect(x, y, w, 6, K2)
-  if s then
+  if s and #s > 0 then
     local t0, tN = s[1][1], s[#s][1]
-    local frac = (hm.tp - t0) / max(1, tN - t0)
+    local frac = clamp(((hm.tp or tN) - t0) / max(1, tN - t0), 0, 1)
     local fw = floor(frac * w)
     rect(x, y, fw, 6, O4)
     rect(clamp(x + fw - 2, x, x + w - 4), y - 3, 4, 12, WH)
     text(x, y + 12, fmtDT(t0), G1, K0)
     rtext(x + w, y + 12, fmtDT(tN), G1, K0)
-    ctext(x, w, y + 12, fmtDT(hm.tp) .. ":" .. string.format("%02d", hm.tp % 60), G2, K0)
+    local tpf = floor(hm.tp or tN)
+    ctext(x, w, y + 12, fmtDT(tpf) .. ":" .. string.format("%02d", tpf % 60), G2, K0)
   end
   if register then addHit("hseek", x, y - 6, w, 20) end
   -- icon row
-  local iy = y + 28
+  local iy = y + 26
   local function ib(id, name, ix, iw, active)
     rect(ix, iy, iw, 26, K0)
     local w0, h0 = iconSize(name, 1)
@@ -1134,9 +1386,10 @@ local function heatControls(register)
   ib("hplay", hm.playing and "pause" or "play", x + 78, 40, true)
   ib("hff", "ff", x + 120, 40, hm.playing and hm.rate > 0)
   ib("hend", "finish", x + 162, 34)
-  local lab = hm.playing and (math.abs(hm.rate) .. "x " .. (hm.rate < 0 and "REWIND" or "PLAY")) or "PAUSED"
-  text(x + 208, iy + 9, lab, hm.playing and O4 or G1, K0)
-  if s then
+  local lab = hm.playing and (math.abs(hm.rate) .. "x " .. (hm.rate < 0 and "REWIND" or "PLAY"))
+              or (hm.follow and "LIVE" or "PAUSED")
+  text(x + 208, iy + 9, lab, (hm.playing or hm.follow) and O4 or G1, K0)
+  if s and #s > 0 then
     local info = string.upper(hm.player) .. "   " .. #s .. " SAMPLES   " .. fmtDur(max(0, s[#s][1] - s[1][1])) .. " TRACKED"
     rtext(x + w, iy + 9, fit(info, w - 300, 1), G1, K0)
   end
@@ -1145,19 +1398,21 @@ end
 local function heatDynamic(register)
   local s = hm.player and data.heat[hm.player]
   local res
-  if s then
+  if s and #s > 0 then
     local t0, tN = s[1][1], s[#s][1]
     if hm.follow or not hm.tp then hm.tp = tN end
     hm.tp = clamp(hm.tp, t0, tN)
     res = buildHeat(s, hm.tp, hm.dim, HL.PW, HL.PH)
+  else
+    s = nil
   end
   pushCanvas(res and res.pix and res or nil)
   if res and res.pix then
-    local lo = string.format("X%d Z%d", res.minX, res.minZ)
-    local hi = string.format("X%d Z%d", res.maxX, res.maxZ)
+    local lo = string.format("X%d Z%d", floor(res.minX), floor(res.minZ))
+    local hi = string.format("X%d Z%d", floor(res.maxX), floor(res.maxZ))
     text(HL.cx + 3, HL.cy + HL.ch - 11, lo, G1, K0)
     rtext(HL.cx + HL.cw - 3, HL.cy + 3, hi, G1, K0)
-    local cur = string.format("%s   X %d   Z %d   GRID %d", dimShort(res.cur[4]), res.cur[2], res.cur[3], res.step)
+    local cur = string.format("%s   X %d   Z %d   GRID %d", dimShort(res.cur[4]), floor(res.cur[2]), floor(res.cur[3]), res.step)
     rtext(HL.cx + HL.cw - 3, HL.cy + HL.ch - 11, cur, O5, K0)
   else
     local msg
@@ -1177,6 +1432,51 @@ local function drawHeat()
   heatLayout()
   rect(HL.cx - 1, HL.cy - 1, HL.cw + 2, HL.ch + 2, K3)
   heatDynamic(true)
+end
+
+--------------------------------------------------------------------
+-- SYSTEM TAB  (live diagnostics)
+--------------------------------------------------------------------
+local function drawSystem()
+  local lx, rb = M, PXW - M
+  local y = CY0
+  text(lx, y, "SYSTEM DIAGNOSTICS", O4, K0)
+  y = y + 14
+  rect(lx, y, rb - lx, 1, K3)
+  y = y + 8
+  local labW = 150
+  local function line(label, value, col)
+    if y > CY1 - 36 then return end
+    text(lx, y, label, G1, K0)
+    local ls = wrapPx(sanitize(value), rb - lx - labW - 10)
+    for _, s in ipairs(ls) do
+      if y > CY1 - 36 then return end
+      text(lx + labW, y, s, col or WH, K0); y = y + 12
+    end
+    y = y + 3
+  end
+  if diag.err ~= "" then line("DETECTOR", diag.err, RD)
+  else line("DETECTOR", peripheral.getName(detector) .. " - " .. diag.n .. " online player(s) returned", O5) end
+  line("POSITIONS", diag.ok .. " ok   " .. diag.fail .. " failed   method: " .. (diag.how ~= "" and diag.how or "-"),
+       diag.fail > 0 and RD or WH)
+  line("CHAT BOX", chatBox and ("connected   " .. diag.chatN .. " events received" ..
+       (diag.chatLast > 0 and ("   last " .. ago(diag.chatLast) .. " ago") or "")) or "NOT FOUND", chatBox and WH or RD)
+  line("LAST CHAT EVENT", diag.chatRaw, G2)
+  local nbtLine = "not connected (disk only)"
+  if nbt then
+    nbtLine = (nbtOK and "OK" or "FAILING") .. "   last write " .. lastSaveBytes .. " bytes   budget " .. nbtBudget ..
+              (diag.nbtWriter ~= "" and ("   via " .. diag.nbtWriter) or "")
+    if diag.nbtErr ~= "" then nbtLine = nbtLine .. "   ERROR: " .. diag.nbtErr end
+  end
+  line("NBT STORAGE", nbtLine, (nbt and not nbtOK) and RD or WH)
+  if nbt then line("NBT METHODS", nbtName .. ": " .. diag.nbtMethods, G2) end
+  line("DISK COPY", diag.localBytes .. " bytes   " .. #data.chat .. " chat entries" ..
+       (diag.saveErr ~= "" and ("   ERROR " .. diag.saveErr) or ""), diag.saveErr ~= "" and RD or WH)
+  line("LAST TOUCH", diag.touch, WH)
+  line("LAST ERROR", diag.lastErr ~= "" and diag.lastErr or "none", diag.lastErr ~= "" and RD or G1)
+
+  btn("syssave", lx, CY1 - 30, 140, 26, "SAVE NOW", "outline", nil, K0)
+  btn("sysdebug", lx + 150, CY1 - 30, 190, 26, "WRITE DEBUG FILE", "outline", nil, K0)
 end
 
 --------------------------------------------------------------------
@@ -1203,26 +1503,30 @@ local function drawerBase(w, title)
   return x, y, w, h
 end
 
-local function drawerRow(id, x, y, w, label, value, d)
-  rect(x + 14, y, w - 28, 38, K1)
-  text(x + 14, y + 6, label, G1, K1)
-  text(x + 14, y + 19, fit(value, w - 56, 1), O5, K1)
-  rect(x + 14, y + 36, w - 28, 1, K2)
-  addHit(id, x + 8, y, w - 16, 38, d)
+local function drawerRow(id, x, y, w, label, value, d, rh)
+  rh = rh or 38
+  local big = rh >= 34
+  rect(x + 14, y, w - 28, rh, K1)
+  text(x + 14, y + (big and 6 or 3), label, G1, K1)
+  text(x + 14, y + (big and 19 or 14), fit(value, w - 56, 1), O5, K1)
+  rect(x + 14, y + rh - 2, w - 28, 1, K2)
+  addHit(id, x + 8, y, w - 16, rh, d)
 end
 
 local function drawFilterDrawer()
   local x, y, w, h = drawerBase(300, "FILTERS")
-  local ry = y + 42
-  drawerRow("fuser", x, ry, w, "USER", userSummary()); ry = ry + 40
-  drawerRow("fday", x, ry, w, "DAY", DAYS[cs.day]); ry = ry + 40
-  drawerRow("ftime", x, ry, w, "TIME", TIMES[cs.time]); ry = ry + 40
-  drawerRow("flen", x, ry, w, "LENGTH", LENS[cs.len]); ry = ry + 40
-  drawerRow("fevents", x, ry, w, "JOIN / LEAVE MESSAGES", cs.events and "SHOWN" or "HIDDEN"); ry = ry + 40
-  drawerRow("fsearch", x, ry, w, "SEARCH PHRASE", cs.q ~= "" and ('"' .. cs.q .. '"') or "tap to type..."); ry = ry + 48
-  btn("freset", x + 14, ry, w - 28, 26, "RESET FILTERS", "outline", nil, K1)
+  local rh = clamp(floor((h - 38 - 46) / 6), 28, 38)
+  local ry = y + 38
+  drawerRow("fuser", x, ry, w, "USER", userSummary(), nil, rh); ry = ry + rh
+  drawerRow("fday", x, ry, w, "DAY", DAYS[cs.day], nil, rh); ry = ry + rh
+  drawerRow("ftime", x, ry, w, "TIME", TIMES[cs.time], nil, rh); ry = ry + rh
+  drawerRow("flen", x, ry, w, "LENGTH", LENS[cs.len], nil, rh); ry = ry + rh
+  drawerRow("fevents", x, ry, w, "JOIN / LEAVE MESSAGES", cs.events and "SHOWN" or "HIDDEN", nil, rh); ry = ry + rh
+  drawerRow("fsearch", x, ry, w, "SEARCH PHRASE", cs.q ~= "" and ('"' .. cs.q .. '"') or "tap to type...", nil, rh)
+  local by = y + h - 36
   local n = #cs.filtered
-  btn("cdelall", x + 14, y + h - 40, w - 28, 28, "DELETE ALL SHOWN (" .. n .. ")", n > 0 and "dangero" or "outline", nil, K1)
+  btn("freset", x + 14, by, 110, 28, "RESET", "outline", nil, K1)
+  btn("cdelall", x + 130, by, w - 144, 28, "DELETE SHOWN (" .. n .. ")", n > 0 and "dangero" or "outline", nil, K1)
 end
 
 local function drawHeatDrawer()
@@ -1311,7 +1615,8 @@ end
 --------------------------------------------------------------------
 -- APP FRAME
 --------------------------------------------------------------------
-local TABS = { { id = "tracking", label = "TRACKING" }, { id = "chat", label = "CHAT LOG" }, { id = "heat", label = "HEATMAP" } }
+local TABS = { { id = "tracking", label = "TRACKING" }, { id = "chat", label = "CHAT LOG" },
+               { id = "heat", label = "HEATMAP" }, { id = "sys", label = "SYSTEM" } }
 
 local function lockRemaining()
   local r = max(0, CONFIG.LOCK_AFTER - (now() - ui.lastAct))
@@ -1323,14 +1628,14 @@ local function drawHeader()
   rect(0, 0, PXW, 2, O4)
   text(M + 2, 8, "NEXUS", O4, K0, 2)
   text(M + 2 + textW("NEXUS", 2) + 8, 17, "TRACKER", G1, K0)
-  local tx = 260
+  local tx = M + 2 + textW("NEXUS", 2) + 8 + textW("TRACKER", 1) + 24
   for _, t in ipairs(TABS) do
     local active = ui.tab == t.id
     local tw = textW(t.label, 1)
-    text(tx + 20, 13, t.label, active and O4 or G1, K0)
-    if active then rect(tx + 14, 28, tw + 12, 2, O4) end
-    addHit("tab", tx, 4, tw + 40, HDR - 4, t.id)
-    tx = tx + tw + 52
+    text(tx + 14, 13, t.label, active and O4 or G1, K0)
+    if active then rect(tx + 8, 28, tw + 12, 2, O4) end
+    addHit("tab", tx, 4, tw + 28, HDR - 4, t.id)
+    tx = tx + tw + 32
   end
   rect(0, HDR, PXW, 1, K3)
 
@@ -1359,15 +1664,19 @@ local function drawFooter()
   text(M + 12, PXH - 13, parts, G2, K1)
   local x = M + 12 + textW(parts, 1) + 22
   local sv = (lastSave > 0) and ("SAVED " .. ago(lastSave) .. " AGO") or "NOT SAVED YET"
-  text(x, PXH - 13, sv, G1, K1); x = x + textW(sv, 1) + 22
+  text(x, PXH - 13, sv, diag.saveErr ~= "" and RD or G1, K1); x = x + textW(sv, 1) + 22
   if nbt then
-    local ns = string.format("NBT %.1f/%.1f KB", lastSaveBytes / 1024, CONFIG.NBT_BUDGET / 1024)
+    local ns = string.format("NBT %.1f/%.1f KB", lastSaveBytes / 1024, nbtBudget / 1024)
     text(x, PXH - 13, ns, nbtOK and G1 or RD, K1); x = x + textW(ns, 1) + 22
   end
-  if diag.fail > 0 then
-    text(x, PXH - 13, "NO POSITION DATA FOR " .. diag.fail .. " PLAYER(S) - SEE NEXUS_DEBUG.TXT", RD, K1)
+  local right = "AUTO-LOCK " .. lockRemaining()
+  local room = PXW - M - textW(right, 1) - 20 - x
+  if diag.err ~= "" then
+    text(x, PXH - 13, fit("DETECTOR ERROR: " .. diag.err, room, 1), RD, K1)
+  elseif diag.fail > 0 then
+    text(x, PXH - 13, fit("NO POSITION DATA FOR " .. diag.fail .. " PLAYER(S) - SEE SYSTEM TAB", room, 1), RD, K1)
   end
-  rtext(PXW - M, PXH - 13, "AUTO-LOCK " .. lockRemaining(), G1, K1)
+  rtext(PXW - M, PXH - 13, right, G1, K1)
 end
 
 local function drawApp()
@@ -1375,6 +1684,7 @@ local function drawApp()
   drawHeader()
   if ui.tab == "tracking" then drawTracking()
   elseif ui.tab == "chat" then drawChat()
+  elseif ui.tab == "sys" then drawSystem()
   else drawHeat() end
   if ui.drawer == "filter" and ui.tab == "chat" then drawFilterDrawer()
   elseif ui.drawer == "heat" and ui.tab == "heat" then drawHeatDrawer()
@@ -1384,23 +1694,25 @@ end
 
 local function render()
   hits = {}
-  freeze(true)
-  if ui.locked then drawLock() else drawApp() end
-  if ui.modal and not ui.locked then
-    hits = {}
-    local m = ui.modal
-    if m.type == "confirm" then drawConfirm(m)
-    elseif m.type == "kbd" then drawKbd(m)
-    elseif m.type == "picker" then drawPicker(m) end
-  end
-  freeze(false)
+  local ok, err = pcall(function()
+    if ui.locked then drawLock() else drawApp() end
+    if ui.modal and not ui.locked then
+      hits = {}
+      local m = ui.modal
+      if m.type == "confirm" then drawConfirm(m)
+      elseif m.type == "kbd" then drawKbd(m)
+      elseif m.type == "picker" then drawPicker(m) end
+    end
+  end)
+  if not ok then logErr("render: " .. tostring(err)) end
+  commit()
 end
 
 local function renderHeatFrame()
   if ui.locked or ui.modal or ui.drawer or ui.tab ~= "heat" then return end
-  freeze(true)
-  heatDynamic(false)
-  freeze(false)
+  local ok, err = pcall(heatDynamic, false)
+  if not ok then logErr("heat frame: " .. tostring(err)) end
+  commit()
 end
 
 --------------------------------------------------------------------
@@ -1432,10 +1744,12 @@ local function openHeatPicker()
   }
 end
 
-local function scrollTo(id, ty, up, down)
+-- tapping the scrollbar jumps straight to that position
+local function seekPos(id, ty)
   local sb = SB[id]
-  if not sb then return end
-  if ty < sb.ty then up() elseif ty > sb.ty + sb.th then down() end
+  if not sb or sb.total <= sb.vis then return nil end
+  local frac = clamp((ty - sb.y - sb.th / 2) / max(1, sb.h - sb.th), 0, 1)
+  return floor(frac * (sb.total - sb.vis) + 0.5), sb.total - sb.vis
 end
 
 local function handleHit(h, tx, ty)
@@ -1449,7 +1763,7 @@ local function handleHit(h, tx, ty)
     if f then f() end
     return
   end
-  if id == "key" then if #ui.modal.buf < 40 then ui.modal.buf = ui.modal.buf .. d end return
+  if id == "key" then if ui.modal and #ui.modal.buf < 40 then ui.modal.buf = ui.modal.buf .. d end return
   elseif id == "kbs" then ui.modal.buf = ui.modal.buf:sub(1, -2) return
   elseif id == "kclr" then ui.modal.buf = "" return
   elseif id == "kok" then cs.q = ui.modal.buf; ui.modal = nil; bumpFilter(); return
@@ -1469,9 +1783,9 @@ local function handleHit(h, tx, ty)
     ui.msg = ""
     if d == "CLR" then ui.pin = ""
     elseif d == "DEL" then ui.pin = ui.pin:sub(1, -2)
-    elseif #ui.pin < 4 then
+    elseif #ui.pin < #CONFIG.PIN then
       ui.pin = ui.pin .. d
-      if #ui.pin == 4 then
+      if #ui.pin == #CONFIG.PIN then
         if ui.pin == CONFIG.PIN then
           ui.locked = false; ui.pin = ""; ui.wrong = 0; ui.lastAct = now()
         else
@@ -1490,11 +1804,16 @@ local function handleHit(h, tx, ty)
   elseif id == "menubtn" then ui.drawer = (ui.drawer == "heat") and nil or "heat"
   elseif id == "drawerclose" then ui.drawer = nil
 
+  -- system
+  elseif id == "syssave" then saveNow()
+  elseif id == "sysdebug" then writeDebug(next(data.players))
+
   -- tracking
   elseif id == "trkrow" then trk.sel = (trk.sel == d) and nil or d
   elseif id == "detclose" then trk.sel = nil
   elseif id == "trkscroll" then
-    scrollTo(id, ty, function() trk.scroll = max(0, trk.scroll - 6) end, function() trk.scroll = trk.scroll + 6 end)
+    local p = seekPos(id, ty)
+    if p then trk.scroll = p end
   elseif id == "trkheat" then
     if trk.sel and data.heat[trk.sel] and #data.heat[trk.sel] > 0 then
       hm.player = trk.sel; hm.tp = nil; hm.follow = true; hm.dim = nil; hm.playing = false
@@ -1510,7 +1829,8 @@ local function handleHit(h, tx, ty)
   -- chat
   elseif id == "cmsg" then cs.sel[d] = (not cs.sel[d]) or nil
   elseif id == "chatscroll" then
-    scrollTo(id, ty, function() cs.scroll = cs.scroll + 12 end, function() cs.scroll = max(0, cs.scroll - 12) end)
+    local p, maxp = seekPos(id, ty)
+    if p then cs.scroll = maxp - p end
   elseif id == "cclear" then cs.sel = {}
   elseif id == "cdelsel" then
     local n, set = 0, {}
@@ -1591,16 +1911,21 @@ local function handleHit(h, tx, ty)
   end
 end
 
+-- monitor_touch may report character cells or raw pixels depending on the
+-- CC: Graphics version. "auto" starts with chars and latches to pixels the
+-- first time a touch lands outside the character grid.
+local touchPixels = (CONFIG.TOUCH_MODE == "pixel")
 local function touchToPx(cx, cy)
-  if cx <= W and cy <= H then
-    return (cx - 0.5) * PXW / W, (cy - 0.5) * PXH / H
-  end
-  return cx, cy
+  if CONFIG.TOUCH_MODE == "auto" and not touchPixels and (cx > W or cy > H) then touchPixels = true end
+  if touchPixels then return cx, cy end
+  return (cx - 0.5) * PXW / W, (cy - 0.5) * PXH / H
 end
 
 local function onTouch(cx, cy)
   if not ui.locked then ui.lastAct = now() end
   local tx, ty = touchToPx(cx, cy)
+  diag.touch = string.format("event %s,%s -> px %d,%d (%s)", tostring(cx), tostring(cy), floor(tx), floor(ty),
+                             touchPixels and "pixel mode" or "char mode")
   for i = #hits, 1, -1 do
     local h = hits[i]
     if tx >= h.x and tx < h.x + h.w and ty >= h.y and ty < h.y + h.h then
@@ -1612,14 +1937,20 @@ end
 
 local function frame()
   local t = os.epoch("utc") / 1000
-  local dt = t - (hm.last or t)
+  local dt = min(0.5, t - (hm.last or t))
   hm.last = t
   if not hm.playing then return end
   local s = hm.player and data.heat[hm.player]
   if not s or #s == 0 then hm.playing = false; return end
   local t0, tN = s[1][1], s[#s][1]
-  local span = max(tN - t0, 60)
+  local span = max(activeDuration(s), 60)       -- 1x plays all active time in ~30s
   hm.tp = (hm.tp or tN) + hm.rate * span / 30 * dt
+  -- skip long idle gaps (player offline / not moving) instead of waiting through them
+  local i = sampleIndex(s, hm.tp)
+  if i >= 1 then
+    if hm.rate > 0 and i < #s and s[i + 1][1] - hm.tp > 45 then hm.tp = s[i + 1][1] - 1
+    elseif hm.rate < 0 and hm.tp - s[i][1] > 45 then hm.tp = s[i][1] + 1 end
+  end
   if hm.rate > 0 and hm.tp >= tN then hm.tp = tN; hm.playing = false; hm.follow = true
   elseif hm.rate < 0 and hm.tp <= t0 then hm.tp = t0; hm.playing = false end
 end
@@ -1627,31 +1958,43 @@ end
 --------------------------------------------------------------------
 -- MAIN
 --------------------------------------------------------------------
+local function safePoll()
+  local ok, err = pcall(poll)
+  if not ok then diag.err = "poll: " .. tostring(err); logErr("poll: " .. tostring(err)) end
+end
+
 local function main()
   loadData()
-  poll()
+  safePoll()
   startup = false
   saveNow()
   local tickT = os.startTimer(1)
   local frameT
   local tick = 0
-  render()
 
-  while true do
-    local ev = { os.pullEventRaw() }
+  local function handle(ev)
     local e = ev[1]
     local redraw, heatOnly = false, false
 
-    if e == "terminate" then
-      break
-
-    elseif e == "monitor_touch" and ev[2] == monName then
+    if e == "monitor_touch" and ev[2] == monName then
       onTouch(ev[3], ev[4]); redraw = true
 
     elseif e == "chat" then
-      if ev[2] and ev[3] then
-        logEvent("c", ev[2], ev[3])
-        ensurePlayer(ev[2])
+      diag.chatN = diag.chatN + 1; diag.chatLast = now()
+      -- the argument order differs between Advanced Peripherals versions, so
+      -- pick the strings out by shape: skip the UUID, then username, message
+      local raw, strs = {}, {}
+      for i = 2, 7 do
+        local v = ev[i]
+        if v ~= nil then
+          raw[#raw + 1] = tostring(v)
+          if type(v) == "string" and not v:match("^%x+%-%x+%-%x+%-%x+%-%x+$") then strs[#strs + 1] = v end
+        end
+      end
+      diag.chatRaw = sanitize(table.concat(raw, " | ")):sub(1, 220)
+      if strs[1] then
+        logEvent("c", strs[1], strs[2] or "(no message)")
+        ensurePlayer(strs[1])
         redraw = true
       end
 
@@ -1686,10 +2029,11 @@ local function main()
         tickT = os.startTimer(1)
         tick = tick + 1
         local polled = false
-        if tick % CONFIG.POLL_EVERY == 0 then poll(); polled = true end
+        if tick % CONFIG.POLL_EVERY == 0 then safePoll(); polled = true end
         if not ui.locked and now() - ui.lastAct >= CONFIG.LOCK_AFTER then lock(); redraw = true end
-        if dirty and now() - lastSave >= CONFIG.SAVE_EVERY then saveNow() end
+        if dirty and now() - lastTry >= CONFIG.SAVE_EVERY then saveNow() end
         if polled and not ui.modal and not (ui.tab == "heat" and hm.playing) then redraw = true end
+        if not polled and ui.tab == "sys" and not ui.locked and not ui.modal then redraw = true end
       elseif ev[2] == frameT then
         frameT = nil
         frame()
@@ -1703,6 +2047,17 @@ local function main()
     end
     if redraw then render()
     elseif heatOnly then renderHeatFrame() end
+  end
+
+  render()
+  while true do
+    local ev = { os.pullEventRaw() }
+    if ev[1] == "terminate" then break end
+    local ok, err = pcall(handle, ev)
+    if not ok then
+      logErr("event " .. tostring(ev[1]) .. ": " .. tostring(err))
+      pcall(render)
+    end
   end
 
   saveNow()
