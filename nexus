@@ -31,6 +31,7 @@ local CONFIG = {
   INV_POLL       = 2,        -- seconds between inventory refreshes (INVENTORY tab only)
   AP_SLOT_BASE   = 0,        -- chest slot numbering used by Advanced Peripherals
                              -- (0 = first slot is 0, set 1 if chest->player grabs the wrong slot)
+  SWAP_IMPORT_EXPORT = false, -- AP 0.8+: set true if TAKE/SEND moves items the wrong way
 }
 
 --------------------------------------------------------------------
@@ -102,7 +103,7 @@ if nbt then
   local ok, m = pcall(peripheral.getMethods, nbtName)
   if ok and type(m) == "table" then
     diag.nbtMethods = table.concat(m, ", ")
-    for _, n in ipairs(m) do if n:match("^write") then nbtNoWrite = false end end
+    for _, n in ipairs(m) do if n:match("^write") or n == "save" then nbtNoWrite = false end end
   end
 end
 
@@ -813,6 +814,7 @@ local function nbtWrite(t)
     return false
   end
   if diag.nbtWriter == "writeJson" and try("writeJson", textutils.serialiseJSON(t)) then return true end
+  if try("save", t) then return true end            -- AP 0.8+ NBT Storage
   if try("writeTable", t) then return true end
   if try("writeJson", textutils.serialiseJSON(t)) then return true end
   for name, fn in pairs(nbt) do
@@ -823,7 +825,7 @@ local function nbtWrite(t)
 end
 
 function nbtRead()
-  for _, name in ipairs({ "read", "readTable", "get" }) do
+  for _, name in ipairs({ "load", "read", "readTable", "get" }) do
     local fn = nbt[name]
     if type(fn) == "function" then
       local ok, t = pcall(fn)
@@ -1204,8 +1206,12 @@ local function invLoad()
       for k, it in pairs(items) do
         local n = norm(it)
         if n then
-          local s = n.slot
-          if s == nil and type(k) == "number" then s = k - base end
+          local s
+          if fnItems == "list" and type(k) == "number" then s = k - base
+          else
+            s = n.slot
+            if s == nil and type(k) == "number" then s = k - base end
+          end
           if s then
             if s >= 100 and s <= 103 then s = 36 + (s - 100) end
             slots[s] = n
@@ -1315,6 +1321,27 @@ local function callMove(mgr, fn, dir, filter)
     end
     return nil, tostring(r)
   end
+  -- Advanced Peripherals 0.8+: importItem(inventory, filter) = chest -> player,
+  -- exportItem(inventory, filter) = player -> chest. Slots are 1-based like list().
+  if mm.importItem and mm.exportItem and not mm[fn] then
+    local f = (fn == "removeItemFromPlayer") and "exportItem" or "importItem"
+    if CONFIG.SWAP_IMPORT_EXPORT then f = (f == "exportItem") and "importItem" or "exportItem" end
+    local shifts = (data.inv.shift == -1) and { -1, 0 } or { 0, -1 }
+    local lastErr
+    for _, sh in ipairs(shifts) do
+      local flt = { name = filter.name, count = filter.count }
+      if filter.fromSlot then flt.fromSlot = filter.fromSlot + sh end
+      if filter.toSlot then flt.toSlot = filter.toSlot + sh end
+      local n, err = try(f, dir, flt)
+      if n and n > 0 then
+        if data.inv.shift ~= sh then data.inv.shift = sh; dirty = true end   -- remember slot numbering
+        return n
+      end
+      lastErr = err
+      if not filter.name then break end   -- an off-by-one retry is only safe when matching by item name
+    end
+    return nil, lastErr
+  end
   if mm.pushItems and not mm[fn] then                   -- newer Advanced Peripherals
     local f = (fn == "removeItemFromPlayer") and "pushItems" or "pullItems"
     local target = dir
@@ -1346,7 +1373,11 @@ local function transfer(mgr, fn, filter)
   local dirs = {}
   for _, v in ipairs((d == "auto") and AUTODIRS or { d }) do dirs[#dirs + 1] = v end
   local cn = chestFor(mgr)
-  if cn then dirs[#dirs + 1] = cn end            -- newer versions can also move by peripheral name
+  if cn then
+    local mm0 = mgrMethods(mgr)
+    if mm0.importItem and mm0.exportItem and not mm0.addItemToPlayer then table.insert(dirs, 1, cn)
+    else dirs[#dirs + 1] = cn end
+  end            -- newer versions can also move by peripheral name
   local errs, seen = {}, {}
   for _, dir in ipairs(dirs) do
     local n, err = callMove(mgr, fn, dir, filter)
@@ -1378,10 +1409,10 @@ function invMove(mode)
   local cnt = (mode == "one") and 1 or (mode == "half" and max(1, floor(it.count / 2)) or it.count)
   local n, err
   if pk.side == "p" then
-    n, err = transfer(mgr, "removeItemFromPlayer", { fromSlot = pk.slot + (st.base or 0), count = cnt })
+    n, err = transfer(mgr, "removeItemFromPlayer", { fromSlot = pk.slot + (st.base or 0), count = cnt, name = it.name })
   else
     local cb = (st.base == 1) and 1 or CONFIG.AP_SLOT_BASE   -- new API: chest slots are 1-based
-    n, err = transfer(mgr, "addItemToPlayer", { fromSlot = pk.slot - 1 + cb, count = cnt })
+    n, err = transfer(mgr, "addItemToPlayer", { fromSlot = pk.slot - 1 + cb, count = cnt, name = it.name })
   end
   if n > 0 then
     invFlash("MOVED " .. n .. "x " .. (it.disp or (it.name:gsub("^.-:", ""))), true)
