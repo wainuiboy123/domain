@@ -1,5 +1,5 @@
 --=====================================================================
---  NEXUS TRACKER  v2.9   -  black & orange pixel UI
+--  NEXUS TRACKER  v2.9.7   -  black & orange pixel UI
 --  CC:Tweaked + Advanced Peripherals + CC: Graphics  (NeoForge 1.21.1)
 --
 --  Needs: Advanced Monitor (6x3), Chat Box, Player Detector, NBT Storage
@@ -1321,11 +1321,36 @@ local function callMove(mgr, fn, dir, filter)
     end
     return nil, tostring(r)
   end
-  -- Advanced Peripherals 0.8+: importItem(inventory, filter) = chest -> player,
-  -- exportItem(inventory, filter) = player -> chest. Slots are 1-based like list().
+  -- Newer Advanced Peripherals: importItem / exportItem. The argument order differs between versions
+  -- (target, filter) vs (filter, target), so both are tried and the one that works is remembered.
+  -- importItem = chest -> player, exportItem = player -> chest. Slots are 1-based like list().
   if mm.importItem and mm.exportItem and not mm[fn] then
     local f = (fn == "removeItemFromPlayer") and "exportItem" or "importItem"
     if CONFIG.SWAP_IMPORT_EXPORT then f = (f == "exportItem") and "importItem" or "exportItem" end
+    local function call2(flt)
+      local function one(swapped)
+        local ok, r, e
+        if swapped then ok, r, e = pcall(peripheral.call, mgr, f, flt, dir)
+        else ok, r, e = pcall(peripheral.call, mgr, f, dir, flt) end
+        if not ok then return nil, tostring(r) end
+        if type(r) == "number" then return r end
+        if type(r) == "table" then
+          local c = tonumber(r.count or r.moved or r.amount or r.transferred)
+          if c then return c end
+          return 0, "returned a table without a count"
+        end
+        return 0, (e ~= nil and tostring(e)) or ("returned " .. tostring(r))
+      end
+      local first = data.inv.argSwap and true or false
+      local n, err = one(first)
+      if n and n > 0 then return n end
+      local n2, err2 = one(not first)
+      if n2 and n2 > 0 then
+        data.inv.argSwap = (not first); dirty = true
+        return n2
+      end
+      return nil, tostring(err) .. " / other arg order: " .. tostring(err2)
+    end
     local shifts = (data.inv.shift == -1) and { -1, 0 } or { 0, -1 }
     local tries = {}
     for _, sh in ipairs(shifts) do tries[#tries + 1] = { sh, true } end
@@ -1338,16 +1363,20 @@ local function callMove(mgr, fn, dir, filter)
       local flt = { name = filter.name, count = filter.count }
       if filter.fromSlot then flt.fromSlot = filter.fromSlot + sh end
       if useTo and filter.toSlot then flt.toSlot = filter.toSlot + sh end
-      local n, err = try(f, dir, flt)
+      local n, err = call2(flt)
       if n and n > 0 then
         if data.inv.shift ~= sh then data.inv.shift = sh; dirty = true end   -- remember slot numbering
         if filter.toSlot and not useTo then inv.note = "TARGET SLOT NOT SUPPORTED - PLACED IN NEXT FREE SLOT" end
         return n
       end
-      lastErr = err
+      lastErr = lastErr or err
       if not filter.name then break end   -- an off-by-one retry is only safe when matching by item name
     end
-    return nil, lastErr
+    if filter.name then                   -- last resort: by item name alone
+      local n = call2({ name = filter.name, count = filter.count })
+      if n and n > 0 then return n end
+    end
+    return nil, lastErr or ("'" .. tostring(dir) .. "' accepted " .. f .. " but moved 0 items")
   end
   if mm.pushItems and not mm[fn] then                   -- newer Advanced Peripherals
     local f = (fn == "removeItemFromPlayer") and "pushItems" or "pullItems"
@@ -1478,6 +1507,11 @@ function invMove(mode)
   else
     local cb = (st.base == 1) and 1 or CONFIG.AP_SLOT_BASE   -- new API: chest slots are 1-based
     n, err = transfer(mgr, "addItemToPlayer", { fromSlot = pk.slot - 1 + cb, count = cnt, name = it.name })
+    if (n or 0) == 0 then
+      local free = 0
+      for i = 0, 35 do if not st.slots[i] then free = free + 1 end end
+      if free == 0 then err = "PLAYER INVENTORY IS FULL (backpack contents are not reachable) | " .. tostring(err) end
+    end
   end
   if n > 0 then
     invFlash("MOVED " .. n .. "x " .. (it.disp or (it.name:gsub("^.-:", ""))), true)
