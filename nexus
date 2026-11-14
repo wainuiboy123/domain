@@ -1,5 +1,5 @@
 --=====================================================================
---  NEXUS TRACKER  v2.7   -  black & orange pixel UI
+--  NEXUS TRACKER  v2.8   -  black & orange pixel UI
 --  CC:Tweaked + Advanced Peripherals + CC: Graphics  (NeoForge 1.21.1)
 --
 --  Needs: Advanced Monitor (6x3), Chat Box, Player Detector, NBT Storage
@@ -1094,7 +1094,7 @@ end
 --   0-8 hotbar, 9-35 main, 36 boots, 37 legs, 38 chestplate, 39 helmet, 40 offhand
 local inv = { mgrs = {}, owners = {}, cands = {}, sel = nil, cache = {}, pick = nil,
               mpage = 0, crow = 0, flash = nil, scanT = 0, methods = {} }
-local DIRS, chestFor, invRefresh, invItemAt, invMove
+local DIRS, chestFor, invRefresh, invItemAt, invMove, invPlace
 do
 DIRS = { "auto", "up", "down", "north", "south", "east", "west", "left", "right", "front", "back" }
 local AUTODIRS = { "up", "down", "north", "south", "east", "west" }
@@ -1317,7 +1317,13 @@ local function callMove(mgr, fn, dir, filter)
     local f = (fn == "removeItemFromPlayer") and "pushItems" or "pullItems"
     local target = dir
     if not tostring(dir):find("^@") and not peripheral.isPresent(dir) then target = "@" .. dir end
-    return try(f, target, { fromSlot = filter.fromSlot, count = filter.count })
+    local n, err = try(f, target, { fromSlot = filter.fromSlot, count = filter.count, toSlot = filter.toSlot, name = filter.name })
+    if (n == nil or n == 0) and filter.fromSlot then      -- plain CC style (target, fromSlot, count, toSlot)
+      local n2, err2 = try(f, target, filter.fromSlot, filter.count, filter.toSlot)
+      if n2 and n2 > 0 then return n2 end
+      if err2 and err2 ~= err then err = tostring(err) .. " / " .. err2 end
+    end
+    return n, err
   end
   local n, err = try(fn, dir, filter)                   -- Advanced Peripherals 0.7.x (filter table)
   if n == nil and filter.fromSlot then                  -- older versions: (dir, count, slot)
@@ -1332,16 +1338,20 @@ local function transfer(mgr, fn, filter)
   for _, v in ipairs((d == "auto") and AUTODIRS or { d }) do dirs[#dirs + 1] = v end
   local cn = chestFor(mgr)
   if cn then dirs[#dirs + 1] = cn end            -- newer versions can also move by peripheral name
-  local lastErr = "no inventory touching the manager on that side?"
+  local errs, seen = {}, {}
   for _, dir in ipairs(dirs) do
     local n, err = callMove(mgr, fn, dir, filter)
     if n and n > 0 then
       if d == "auto" and dir ~= cn then data.inv.dir[mgr] = dir; dirty = true end   -- remember what worked
       return n
     end
-    if err and err ~= "" then lastErr = err end
+    if err and err ~= "" and not seen[err] then seen[err] = true; errs[#errs + 1] = err end
   end
-  return 0, lastErr
+  local full = (#errs > 0) and table.concat(errs, " | ") or "no inventory touching the manager on that side?"
+  logErr("move " .. fn .. ": " .. full)
+  local short = {}
+  for i = 1, math.min(3, #errs) do short[i] = errs[i] end
+  return 0, (#short > 0) and table.concat(short, " | ") or full
 end
 
 function invItemAt(st, side, slot)
@@ -1371,6 +1381,88 @@ function invMove(mode)
   end
   invRefresh(false)
   if not invItemAt(inv.cache[mgr], pk.side, pk.slot) then inv.pick = nil end
+end
+
+-- click-to-place: move the picked stack to any slot (swaps if a different item is there) ------
+local function pslot(st, s) return s + (st.base or 0) end
+local function cslot(st, i) return i - 1 + ((st.base == 1) and 1 or CONFIG.AP_SLOT_BASE) end
+
+local function freeChestSlot(st, avoid)
+  local c = st.chest
+  if not c then return nil end
+  for i = 1, c.size do
+    if not c.items[i] and not avoid[i] then return i end
+  end
+end
+
+-- move a whole stack between two exact slots. side: "p" = player, "c" = chest
+local function mv(st, mgr, fs, fslot, ts, tslot, cnt, avoid, name)
+  if fs == "p" and ts == "c" then
+    return transfer(mgr, "removeItemFromPlayer",
+      { fromSlot = pslot(st, fslot), toSlot = cslot(st, tslot), count = cnt, name = name })
+  elseif fs == "c" and ts == "p" then
+    return transfer(mgr, "addItemToPlayer",
+      { fromSlot = cslot(st, fslot), toSlot = pslot(st, tslot), count = cnt, name = name })
+  elseif fs == "c" and ts == "c" then
+    local cn = st.chest and st.chest.name
+    if not cn then return 0, "NO CHEST CONNECTED" end
+    local ok, r = pcall(peripheral.call, cn, "pushItems", cn, fslot, cnt, tslot)
+    if ok and type(r) == "number" and r > 0 then return r end
+    return 0, ok and "chest would not move it" or tostring(r)
+  end
+  -- player -> player: hop through a spare chest slot
+  local t = freeChestSlot(st, avoid or {})
+  if not t then return 0, "NEED A FREE CHEST SLOT TO REARRANGE THE PLAYER INVENTORY" end
+  local a = {}
+  for k, v in pairs(avoid or {}) do a[k] = v end
+  a[t] = true
+  local n, err = mv(st, mgr, "p", fslot, "c", t, cnt, a, name)
+  if not n or n == 0 then return 0, err end
+  local n2, err2 = mv(st, mgr, "c", t, "p", tslot, n, a, name)
+  if (n2 or 0) < n then mv(st, mgr, "c", t, "p", fslot, n - (n2 or 0), a, name) end   -- put leftovers back
+  return n2 or 0, err2
+end
+
+function invPlace(side, slot)
+  local mgr, pk = inv.sel, inv.pick
+  local st = mgr and inv.cache[mgr]
+  if not st or not pk then return end
+  local a = invItemAt(st, pk.side, pk.slot)
+  if not a then inv.pick = nil; return end
+  if pk.side == side and pk.slot == slot then inv.pick = nil; return end
+  if side == "c" and not st.chest then invFlash("NO CHEST CONNECTED", false); return end
+  local b = invItemAt(st, side, slot)
+  local n, err
+  if not b or b.name == a.name then
+    n, err = mv(st, mgr, pk.side, pk.slot, side, slot, a.count, nil, a.name)
+  else
+    local avoid = {}
+    if pk.side == "c" then avoid[pk.slot] = true end
+    if side == "c" then avoid[slot] = true end
+    local t = freeChestSlot(st, avoid)
+    if not t then
+      invFlash("SWAP NEEDS ONE FREE CHEST SLOT", false)
+      return
+    end
+    avoid[t] = true
+    local n1, e1 = mv(st, mgr, pk.side, pk.slot, "c", t, a.count, avoid, a.name)
+    if not n1 or n1 == 0 then
+      n, err = 0, e1
+    else
+      local n2, e2 = mv(st, mgr, side, slot, pk.side, pk.slot, b.count, avoid, b.name)
+      local n3, e3 = mv(st, mgr, "c", t, side, slot, n1, avoid, a.name)
+      n = n3 or 0
+      err = (n2 and n2 > 0) and e3 or e2
+      if n > 0 and (not n2 or n2 == 0) then err = "SWAP INCOMPLETE: " .. tostring(e2) end
+    end
+  end
+  if n and n > 0 then
+    invFlash("MOVED " .. n .. "x " .. (a.disp or (a.name:gsub("^.-:", ""))), true)
+  else
+    invFlash("FAILED: " .. tostring(err), false)
+  end
+  inv.pick = nil
+  invRefresh(false)
 end
 
 end -- do (inventory)
@@ -1905,22 +1997,25 @@ local function drawInv()
     local where = (pk.side == "p") and ("PLAYER SLOT " .. pk.slot) or ("CHEST SLOT " .. pk.slot)
     text(lx + 28, py + 11, fit(where .. "   " .. it.name, 280, 1), G1, K0)
     local bx = lx + 330
-    text(bx, py + 1, pk.side == "p" and "SEND TO CHEST" or "TAKE TO PLAYER", O5, K0)
+    text(bx, py + 1, fit(pk.side == "p" and "TAP A SLOT TO MOVE, OR SEND TO CHEST" or "TAP A SLOT TO MOVE, OR TAKE TO PLAYER", PXW - bx - M, 1), O5, K0)
     btn("invmove", bx, py + 14, 56, 26, "ONE", "solid", "one", K0)
     btn("invmove", bx + 62, py + 14, 62, 26, "HALF", "solid", "half", K0)
     btn("invmove", bx + 130, py + 14, 56, 26, "ALL", "solid", "all", K0)
     btn("invdesel", bx + 192, py + 14, 96, 26, "DESELECT", "outline", nil, K0)
   else
-    text(lx, py + 2, "TAP A SLOT TO SELECT IT, THEN CHOOSE HOW MANY TO MOVE", G1, K0)
-    text(lx, py + 14, "PLAYER ITEMS GO INTO THE CHEST - CHEST ITEMS GO BACK TO THE PLAYER", K3, K0)
+    text(lx, py + 2, "TAP A SLOT WITH AN ITEM, THEN TAP ANY OTHER SLOT TO MOVE IT THERE", G1, K0)
+    text(lx, py + 14, "A DIFFERENT ITEM IN THE WAY GETS SWAPPED (NEEDS ONE FREE CHEST SLOT)", K3, K0)
   end
   local sy = py + 46
   btn("invdir", lx, sy, 130, 26, "DIR: " .. string.upper(data.inv.dir[inv.sel] or "auto"), "outline", nil, K0)
   btn("invchest", lx + 136, sy, 210, 26, "CHEST: " .. (data.inv.chest[inv.sel] or (cname and "AUTO") or "PICK"), "outline", nil, K0)
   btn("invrefresh", lx + 352, sy, 100, 26, "REFRESH", "outline", nil, K0)
   local fl = inv.flash
-  if fl and now() - fl.t < 8 then
-    text(lx, sy + 32, fit(fl.msg, rb - lx, 1), fl.ok and O5 or RD, K0)
+  if fl and now() - fl.t < 15 then
+    for i, ln in ipairs(wrapPx(fl.msg, rb - lx)) do
+      if i > 3 then break end
+      text(lx, sy + 32 + (i - 1) * 11, ln, fl.ok and O5 or RD, K0)
+    end
   end
 end
 
@@ -2628,9 +2723,10 @@ local function handleHit(h, tx, ty)
   elseif id == "invslot" then
     local st = inv.sel and inv.cache[inv.sel]
     local it = invItemAt(st, d.side, d.slot)
-    if not it then inv.pick = nil
-    elseif inv.pick and inv.pick.side == d.side and inv.pick.slot == d.slot then inv.pick = nil
-    else inv.pick = { side = d.side, slot = d.slot } end
+    if inv.pick then
+      if inv.pick.side == d.side and inv.pick.slot == d.slot then inv.pick = nil     -- tap again = drop it
+      else invPlace(d.side, d.slot) end                                              -- tap another slot = move there
+    elseif it then inv.pick = { side = d.side, slot = d.slot } end
   elseif id == "invdesel" then inv.pick = nil
   elseif id == "invmove" then invMove(d)
   elseif id == "invdir" then
