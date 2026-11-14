@@ -1,5 +1,5 @@
 --=====================================================================
---  NEXUS TRACKER  v2.8   -  black & orange pixel UI
+--  NEXUS TRACKER  v2.9   -  black & orange pixel UI
 --  CC:Tweaked + Advanced Peripherals + CC: Graphics  (NeoForge 1.21.1)
 --
 --  Needs: Advanced Monitor (6x3), Chat Box, Player Detector, NBT Storage
@@ -11,7 +11,7 @@
 --=====================================================================
 
 local CONFIG = {
-  PIN            = "421299", -- 6 digits
+  PIN            = "421209", -- 6 digits
   LOCK_AFTER     = 180,      -- seconds idle before auto-lock
   TEXT_SCALE     = 0.5,      -- monitor text scale (sets pixel resolution)
   GFX_MODE       = 2,        -- CC: Graphics mode (2 = 256 colours)
@@ -1163,13 +1163,15 @@ function chestFor(mgr)
   return nil
 end
 
+-- FIX v2.9: a failed/empty method lookup is no longer cached, so the manager's
+-- real API (pushItems/pullItems vs removeItemFromPlayer/addItemToPlayer) is detected
 local function mgrMethods(name)
   local m = inv.methods[name]
   if m then return m end
   m = {}
   local ok, list = pcall(peripheral.getMethods, name)
   if ok and type(list) == "table" then for _, x in ipairs(list) do m[x] = true end end
-  inv.methods[name] = m
+  if next(m) then inv.methods[name] = m end
   return m
 end
 
@@ -1324,6 +1326,13 @@ local function callMove(mgr, fn, dir, filter)
       if err2 and err2 ~= err then err = tostring(err) .. " / " .. err2 end
     end
     return n, err
+  end
+  -- FIX v2.9: the manager has a method list but not this method -> say what it does have
+  if next(mm) and not mm[fn] then
+    local have = {}
+    for k in pairs(mm) do if k:find("Item") then have[#have + 1] = k end end
+    table.sort(have)
+    return nil, "manager has no " .. fn .. " (has: " .. table.concat(have, ", ") .. ")"
   end
   local n, err = try(fn, dir, filter)                   -- Advanced Peripherals 0.7.x (filter table)
   if n == nil and filter.fromSlot then                  -- older versions: (dir, count, slot)
