@@ -1,5 +1,5 @@
 --=====================================================================
---  NEXUS TRACKER  v3.0   -  black & orange pixel UI
+--  NEXUS TRACKER  v2.9   -  black & orange pixel UI
 --  CC:Tweaked + Advanced Peripherals + CC: Graphics  (NeoForge 1.21.1)
 --
 --  Needs: Advanced Monitor (6x3), Chat Box, Player Detector, NBT Storage
@@ -11,7 +11,7 @@
 --=====================================================================
 
 local CONFIG = {
-  PIN            = "421263", -- 6 digits
+  PIN            = "421209", -- 6 digits
   LOCK_AFTER     = 180,      -- seconds idle before auto-lock
   TEXT_SCALE     = 0.5,      -- monitor text scale (sets pixel resolution)
   GFX_MODE       = 2,        -- CC: Graphics mode (2 = 256 colours)
@@ -1099,7 +1099,7 @@ local inv = { mgrs = {}, owners = {}, cands = {}, sel = nil, cache = {}, pick = 
 local DIRS, chestFor, invRefresh, invItemAt, invMove, invPlace
 do
 DIRS = { "auto", "up", "down", "north", "south", "east", "west", "left", "right", "front", "back" }
-local AUTODIRS = { "up", "down", "north", "south", "east", "west" }
+local AUTODIRS = { "up", "down", "north", "south", "east", "west", "top", "bottom", "left", "right", "front", "back" }
 
 local function natKey(s) return (s:gsub("%d+", function(d) return string.format("%08d", tonumber(d)) end)) end
 
@@ -1441,7 +1441,17 @@ local function transfer(mgr, fn, filter)
       end
     end
   end
-  if #sideFail > 0 then errs[#errs + 1] = "sides (" .. table.concat(sideFail, ",") .. ") are not valid targets" end
+  local tried = {}
+  for _, dir in ipairs(dirs) do if isChest[dir] then tried[#tried + 1] = tostring(dir) end end
+  errs[#errs + 1] = "chest targets tried: " .. ((#tried > 0) and table.concat(tried, ",") or "NONE (no chest peripheral known - pick one with the CHEST button)")
+  if #sideFail > 0 then errs[#errs + 1] = #sideFail .. " sides rejected" end
+  do
+    local mm = mgrMethods(mgr)
+    local have = {}
+    for k in pairs(mm) do if k:find("Item") or k:find("Player") then have[#have + 1] = k end end
+    table.sort(have)
+    if #have > 0 then errs[#errs + 1] = "manager methods: " .. table.concat(have, ",") end
+  end
   local full = (#errs > 0) and table.concat(errs, " | ") or "no inventory reachable from the manager (is the chest on the wired network?)"
   logErr("move " .. fn .. ": " .. full)
   local short = {}
