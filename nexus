@@ -1,8 +1,10 @@
 --=====================================================================
---  NEXUS TRACKER  v2.3   -  black & orange pixel UI
+--  NEXUS TRACKER  v2.4   -  black & orange pixel UI
 --  CC:Tweaked + Advanced Peripherals + CC: Graphics  (NeoForge 1.21.1)
 --
 --  Needs: Advanced Monitor (6x3), Chat Box, Player Detector, NBT Storage
+--         NEW: one or more Inventory Managers (with a memory card each) on
+--         the wired network + the chest(s) touching them, also on the network
 --  Run:   nexus        (or save as startup.lua)
 --  Debug: SYSTEM tab shows live diagnostics. Files written on the computer:
 --         nexus_debug.txt (detector methods + raw data), nexus_error.txt (errors)
@@ -26,6 +28,9 @@ local CONFIG = {
   ERROR_FILE     = "nexus_error.txt",
   MAX_CHAT       = 5000,
   MAX_HEAT       = 20000,
+  INV_POLL       = 2,        -- seconds between inventory refreshes (INVENTORY tab only)
+  AP_SLOT_BASE   = 0,        -- chest slot numbering used by Advanced Peripherals
+                             -- (0 = first slot is 0, set 1 if chest->player grabs the wrong slot)
 }
 
 --------------------------------------------------------------------
@@ -147,8 +152,6 @@ local function freeze(b) pcall(mon.setFrozen, b) end
 
 -- Off-screen framebuffer. Everything draws into FB (pure Lua, instant), then
 -- commit() pushes only the rows that changed in one or two drawPixels calls.
--- The old version made hundreds of monitor calls per redraw, which is what
--- made taps feel laggy and unresponsive.
 local FB, SHOWN = {}, {}
 do
   local blank = string.rep(string.char(K0), PXW)
@@ -455,9 +458,283 @@ local function iconSize(name, sc)
 end
 
 --------------------------------------------------------------------
+-- ITEM ICONS  (procedural 16x16 pixel art - CC cannot load game textures,
+-- so every item gets a shape picked from its id + a colour from its material)
+--------------------------------------------------------------------
+local CCDEF = { 0xF0F0F0, 0xF2B233, 0xE57FD8, 0x99B2F2, 0xDEDE6C, 0x7FCC19, 0xF2B2CC, 0x4C4C4C,
+                0x999999, 0x4C99B2, 0xB266E5, 0x3366CC, 0x7F664C, 0x57A64E, 0xCC4C4C, 0x111111 }
+local POOL, poolN = {}, 0
+for i = 40, 255 do if i ~= 64 and i ~= 128 then POOL[#POOL + 1] = i end end
+local cidx = {}
+
+local function rgbSplit(c) return floor(c / 65536) % 256, floor(c / 256) % 256, c % 256 end
+local function shade(rgb, f)
+  local r, g, b = rgbSplit(rgb)
+  return clamp(floor(r * f + 0.5), 0, 255) * 65536 + clamp(floor(g * f + 0.5), 0, 255) * 256 + clamp(floor(b * f + 0.5), 0, 255)
+end
+local function lighten(rgb, t)
+  local r, g, b = rgbSplit(rgb)
+  return floor(r + (255 - r) * t) * 65536 + floor(g + (255 - g) * t) * 256 + floor(b + (255 - b) * t)
+end
+
+local function nearestDefault(r, g, b)
+  local best, bi = math.huge, 0
+  for i, c in ipairs(CCDEF) do
+    local r2, g2, b2 = rgbSplit(c)
+    local d = (r - r2) ^ 2 + (g - g2) ^ 2 + (b - b2) ^ 2
+    if d < best then best = d; bi = i - 1 end
+  end
+  return bi
+end
+
+-- gives every distinct colour its own palette slot (quantised to 6 levels/channel)
+local function colorIndex(rgb)
+  local r, g, b = rgbSplit(rgb)
+  local qr, qg, qb = floor(r / 51 + 0.5), floor(g / 51 + 0.5), floor(b / 51 + 0.5)
+  local key = qr * 36 + qg * 6 + qb
+  local i = cidx[key]
+  if i then return i end
+  if palOK and poolN < #POOL then
+    poolN = poolN + 1
+    local idx = POOL[poolN]
+    if pcall(mon.setPaletteColor, idx, (qr * 51) * 65536 + (qg * 51) * 256 + (qb * 51)) then
+      cidx[key] = idx
+      return idx
+    end
+  end
+  local d = nearestDefault(r, g, b)
+  cidx[key] = d
+  return d
+end
+
+local function hashRGB(s)
+  local h = 5381
+  for i = 1, #s do h = (h * 33 + s:byte(i)) % 2147483647 end
+  local hue = (h % 360) / 60
+  local sat, val = 0.55, 0.85
+  local c = val * sat
+  local x = c * (1 - math.abs(hue % 2 - 1))
+  local m = val - c
+  local r, g, b
+  local i = floor(hue)
+  if i == 0 then r, g, b = c, x, 0 elseif i == 1 then r, g, b = x, c, 0 elseif i == 2 then r, g, b = 0, c, x
+  elseif i == 3 then r, g, b = 0, x, c elseif i == 4 then r, g, b = x, 0, c else r, g, b = c, 0, x end
+  return floor((r + m) * 255) * 65536 + floor((g + m) * 255) * 256 + floor((b + m) * 255)
+end
+
+local MATS = {
+  { "netherite", 0x4d4349 }, { "diamond", 0x4aedd9 }, { "emerald", 0x17dd62 }, { "golden", 0xfcee4b },
+  { "gold", 0xfcee4b }, { "iron", 0xd8d8d8 }, { "copper", 0xe77c56 }, { "redstone", 0xff2a1a },
+  { "lapis", 0x345ec3 }, { "coal", 0x2b2b2b }, { "charcoal", 0x3a3028 }, { "quartz", 0xeee8e0 },
+  { "amethyst", 0xa36be0 }, { "obsidian", 0x2b1a45 }, { "brass", 0xd9b24a }, { "zinc", 0xb7c4c4 },
+  { "steel", 0xa6adb5 }, { "uranium", 0x6fe03a }, { "plutonium", 0x9bd36a }, { "lead", 0x5d6a82 },
+  { "tin", 0xc9d7dc }, { "silver", 0xdfe6ea }, { "nickel", 0xb9b49a }, { "osmium", 0x8fb2d8 },
+  { "bronze", 0xc08540 }, { "leather", 0x9c5a2b }, { "wooden", 0xb8945f }, { "dark_oak", 0x4a3219 },
+  { "oak", 0xb8945f }, { "wood", 0xb8945f }, { "spruce", 0x7a5a34 }, { "birch", 0xd6c78d },
+  { "jungle", 0xb08057 }, { "acacia", 0xba6337 }, { "mangrove", 0x76353c }, { "cherry", 0xe8b4b8 },
+  { "bamboo", 0xc7bc4f }, { "crimson", 0x8f2c4e }, { "warped", 0x2d8d82 }, { "cobblestone", 0x7f7f7f },
+  { "deepslate", 0x4a4a50 }, { "andesite", 0x8a8a8f }, { "diorite", 0xc8c8c8 }, { "granite", 0xa06a5a },
+  { "stone", 0x8a8a8a }, { "dirt", 0x866043 }, { "grass", 0x5d9a3a }, { "sand", 0xdbd3a0 },
+  { "gravel", 0x857f7c }, { "glass", 0xc0f0ff }, { "water", 0x3f76e4 }, { "lava", 0xff6a00 },
+  { "milk", 0xf4f4f4 }, { "blaze", 0xffb100 }, { "ender", 0x1a8f7a }, { "slime", 0x6fc95b },
+  { "gunpowder", 0x6b6b6b }, { "string", 0xeeeeee }, { "bone", 0xe6e2c9 }, { "flint", 0x3d3d3d },
+  { "clay", 0xa0a7b6 }, { "brick", 0xa0472f }, { "netherrack", 0x6f2f2f }, { "glowstone", 0xffd27a },
+  { "prismarine", 0x5ba192 }, { "wheat", 0xd9bf54 }, { "carrot", 0xff8f10 }, { "potato", 0xd9b45b },
+  { "beetroot", 0xa02030 }, { "apple", 0xd02a2a }, { "melon", 0x80c030 }, { "pumpkin", 0xe08014 },
+  { "cocoa", 0x6b3d17 }, { "sugar", 0xf5f5f5 }, { "bread", 0xc89040 }, { "beef", 0xb04040 },
+  { "porkchop", 0xe89090 }, { "chicken", 0xe8c8a0 }, { "mutton", 0xb05050 }, { "salmon", 0xd87060 },
+  { "light_blue", 0x3aafd9 }, { "light_gray", 0x8e8e86 }, { "white", 0xf2f2f2 }, { "orange", 0xf07613 },
+  { "magenta", 0xbd44b3 }, { "yellow", 0xf8c627 }, { "lime", 0x70b919 }, { "pink", 0xed8dac },
+  { "gray", 0x3e4447 }, { "cyan", 0x158991 }, { "purple", 0x792aac }, { "blue", 0x35399d },
+  { "brown", 0x724728 }, { "green", 0x546d1b }, { "red", 0xa12722 }, { "black", 0x1d1d21 },
+}
+local function matColor(path, full)
+  for _, m in ipairs(MATS) do if path:find(m[1], 1, true) then return m[2] end end
+  return hashRGB(full)
+end
+
+local function classify(p)
+  if p:find("pickaxe") then return "pickaxe" end
+  if p:find("sword") or p:find("katana") or p:find("saber") or p:find("dagger") then return "sword" end
+  if p:match("_axe$") or p == "axe" then return "axe" end
+  if p:find("shovel") then return "shovel" end
+  if p:match("_hoe$") then return "hoe" end
+  if p:find("helmet") then return "helmet" end
+  if p:find("chestplate") then return "chest" end
+  if p:find("leggings") then return "legs" end
+  if p:find("boots") then return "boots" end
+  if p:find("bucket") then return "bucket" end
+  if p:find("potion") or p:find("bottle") or p:find("vial") then return "bottle" end
+  if p:match("_ore$") or p == "ore" then return "ore" end
+  if p:find("ingot") or p:match("_bar$") then return "ingot" end
+  if p:find("nugget") or p:find("^raw_") or p:find("scrap") then return "nugget" end
+  if p:find("dust") or p:find("powder") or p:match("dye$") or p == "redstone" or p == "sugar" then return "dust" end
+  if p:find("stick") or p:find("rod") or p:find("arrow") then return "rod" end
+  if p:match("diamond$") or p:match("emerald$") or p:find("shard") or p:find("crystal") or p:find("gem")
+     or p:match("quartz$") or p:find("lapis") or p:find("pearl") then return "gem" end
+  if p:find("apple") or p:find("bread") or p:find("carrot") or p:find("potato") or p:find("beef")
+     or p:find("porkchop") or p:find("chicken") or p:find("mutton") or p:match("cod$") or p:find("salmon")
+     or p:find("melon") or p:find("cookie") or p:find("pie") or p:find("berries") or p:find("beetroot")
+     or p:find("stew") or p:find("steak") then return "food" end
+  if p:find("block") or p:find("planks") or p:match("_log$") or p:find("^log") or p:match("wood$")
+     or p:find("stone") or p:find("brick") or p:find("dirt") or p:find("glass") or p:find("slab")
+     or p:find("stairs") or p:find("casing") or p:find("wool") or p:find("concrete") or p:find("terracotta")
+     or p:find("sand") or p:find("gravel") or p:find("cobble") or p:find("deepslate") or p:find("andesite")
+     or p:find("diorite") or p:find("granite") or p:find("netherrack") or p:find("obsidian")
+     or p:find("leaves") or p:find("clay") or p:find("grass") or p:find("ice") or p:find("fence")
+     or p:find("door") or p:find("chest") or p:find("barrel") or p:find("furnace") or p:find("table") then
+    return "block"
+  end
+  return "letter"
+end
+
+local function blockTpl(n)
+  local rows = {}
+  for y = 1, n do
+    local r = {}
+    for x = 1, n do
+      local ch
+      if y == 1 or y == n or x == 1 or x == n then ch = "o"
+      elseif y == 2 or x == 2 then ch = "c"
+      elseif y == n - 1 or x == n - 1 then ch = "b"
+      else ch = "a" end
+      r[x] = ch
+    end
+    rows[y] = table.concat(r)
+  end
+  return rows
+end
+
+local TPL = {
+  block = blockTpl(14), ore = blockTpl(14), letter = blockTpl(14),
+  sword = { "..............oo", ".............occ", "............occa", "...........occa.", "..........occa..",
+            ".........occa...", "........occa....", ".o.....occa.....", ".oo...occa......", "..oo.occa.......",
+            "...oooca........", "....ooa.........", "...ohho.........", "..ohHho.........", ".ohHo...........", ".ooo............" },
+  pickaxe = { "..oooooooo......", ".occccccaaao....", "oca....ooccao...", "oa........occo..", "o..........oao..",
+              "...........ohho.", "..........ohHo..", ".........ohHo...", "........ohHo....", ".......ohHo.....",
+              "......ohHo......", ".....ohHo.......", "....ohHo........", "...ohHo.........", "...oHo..........", "....o..........." },
+  axe = { ".....oooo.......", "....occcao......", "...occcaaao.....", "...occaaaaoo....", "....ocaaaoho....",
+          ".....oooohHo....", ".........hHo....", "........ohHo....", ".......ohHo.....", "......ohHo......",
+          ".....ohHo.......", "....ohHo........", "...ohHo.........", "..ohHo..........", "..oHo...........", "...o............" },
+  shovel = { "..........oooo..", ".........occcao.", ".........occaaao", ".........ocaaaao", "..........ocaabo",
+             "...........obbo.", "..........ohHo..", ".........ohHo...", "........ohHo....", ".......ohHo.....",
+             "......ohHo......", ".....ohHo.......", "....ohHo........", "...ohHo.........", "..ohHo..........", "..ooo..........." },
+  hoe = { "....ooooooo.....", "...occcccaao....", "...ocaaaaabo....", "....oooooboho...", "..........hHo...",
+          ".........ohHo...", "........ohHo....", ".......ohHo.....", "......ohHo......", ".....ohHo.......",
+          "....ohHo........", "...ohHo.........", "..ohHo..........", "..oHo...........", "...o............" },
+  helmet = { "...oooooooooo...", "..occcccccccao..", ".occaaaaaaaaabo.", ".ocaaaaaaaaaabo.", ".ocaaaaaaaaaabo.",
+             ".ocaaoooooaaabo.", ".ocao.....oabo..", ".ooo.......ooo.." },
+  chest = { ".oo........oo...", ".ocoo....oocao..", ".occaoooooacabo.", ".occaaaaaaaaabo.", ".ocaaaaaaaaaabo.",
+            ".ocaaaaaaaaaabo.", "..ocaaaaaaaabo..", "..ocaaaaaaaabo..", "..ocaaaaaaaabo..", "..obbbbbbbbbbo..",
+            "...oooooooooo..." },
+  legs = { "..oooooooooooo..", ".occcaaaaaaaaao.", ".ocaaaaaaaaaabo.", ".ocaaaaaaaaaabo.", ".ocaaaoo.oaaabo.",
+           ".ocaaao...oaabo.", ".ocaabo...obabo.", ".ocaabo...obabo.", ".obbbbo...obbbo.", "..oooo.....oooo." },
+  boots = { "..ooo....ooo....", ".ocaao..ocaao...", ".ocaao..ocaao...", ".ocaao..ocaao...", ".ocaaooooaaaoo..",
+            ".ocaaaaaoaaaaoo.", ".obbbbbbobbbbbo.", "..oooooooooooo.." },
+  ingot = { "....oooooooo....", "...occcccccao...", "..occcccccaaao..", ".ocaaaaaaaaaabo.", ".ocaaaaaaaaabbo.",
+            ".obbbbbbbbbbbo..", "..oooooooooooo.." },
+  gem = { "....oooooooo....", "...occcccccao...", "..occcaaaaaaao..", ".ocacaaaaaaaabo.", ".occaaaaaaaaabo.",
+          "..ocaaaaaaaabo..", "...ocaaaaaabo...", "....ocaaaabo....", ".....ocaabo.....", "......obbo......",
+          ".......oo......." },
+  dust = { ".......oo.......", "......oaao......", ".....occaao.....", "....occaaaao....", "...occaaaaabo...",
+           "..occaaaaaaabo..", ".obbaaaaaaabbbo.", ".oooooooooooooo." },
+  nugget = { "......oooo......", ".....occao......", "....occaaao.....", "....ocaaabo.....", ".....obbbo......",
+             "......ooo......." },
+  food = { "........hh......", ".......ohHo.....", ".....oooooooo...", "....occccaaaao..", "...occcaaaaaaao.",
+           "...ocaaaaaaaabo.", "...ocaaaaaaaabo.", "...ocaaaaaaabbo.", "....obaaaaaabo..", ".....obbbbbbo...",
+           "......oooooo...." },
+  bucket = { "..oooooooooooo..", "..ocaaaaaaaabo..", "...ocxxxxxxbo...", "...ocxxxxxxbo...", "...ocxxxxxxbo...",
+             "....ocxxxxbo....", "....ocaaaabo....", ".....obbbbo.....", "......oooo......" },
+  bottle = { "......oooo......", "......ocao......", "......ocao......", ".....occao......", "....ocaaaao.....",
+             "...ocxxxxxao....", "...ocxxxxxxbo...", "...ocxxxxxxbo...", "...ocxxxxxbbo...", "....obbbbbbo....",
+             ".....oooooo....." },
+  rod = { "..............oo", ".............oca", "............ocao", "...........ocao.", "..........ocao..",
+          ".........ocao...", "........ocao....", ".......ocao.....", "......ocao......", ".....ocao.......",
+          "....ocao........", "...ocao.........", "..ocao..........", ".ocao...........", ".oao............",
+          ".oo............." },
+}
+
+local function stamp(rows)
+  local h, w = #rows, 0
+  for _, r in ipairs(rows) do w = max(w, #r) end
+  local oy, ox = floor((16 - h) / 2), floor((16 - w) / 2)
+  local g = {}
+  for y = 1, 16 do g[y] = {}; for x = 1, 16 do g[y][x] = "." end end
+  for y, r in ipairs(rows) do
+    for x = 1, #r do
+      local ch = r:sub(x, x)
+      local yy, xx = y + oy, x + ox
+      if ch ~= "." and yy >= 1 and yy <= 16 and xx >= 1 and xx <= 16 then g[yy][xx] = ch end
+    end
+  end
+  return g
+end
+
+local icache = {}
+local function itemIcon(name, bgIdx)
+  local key = name .. ":" .. bgIdx
+  local cached = icache[key]
+  if cached then return cached end
+  local path = (name:gsub("^.-:", "")):lower()
+  local shape = classify(path)
+  local base = matColor(path, name)
+  local accent = 0xffffff
+  if shape == "ore" then
+    accent = base
+    if path:find("deepslate") then base = 0x4a4a50 elseif path:find("nether") then base = 0x6f2f2f else base = 0x8a8a8a end
+  elseif shape == "bucket" then
+    accent = (path:find("water") and 0x3f76e4) or (path:find("lava") and 0xff6a00) or (path:find("milk") and 0xf4f4f4) or 0x2a2a2a
+    base = 0xc8c8c8
+  elseif shape == "bottle" then
+    accent = path:find("water") and 0x3f76e4 or hashRGB(name)
+    base = 0xb0e0f0
+  elseif shape == "rod" and path:find("stick") then
+    base = 0x9c7a46
+  end
+  local g = stamp(TPL[shape])
+  if shape == "ore" then
+    for y = 1, 16 do for x = 1, 16 do
+      if g[y][x] == "a" and ((x * 5 + y * 11) % 7 == 0 or (x + y * 3) % 11 == 0) then g[y][x] = "x" end
+    end end
+  elseif shape == "letter" then
+    local f = FONTP[path:sub(1, 1):upper()]
+    if f then
+      local lx0, ly0 = floor((16 - f.w) / 2) + 1, 5
+      for r, pat in ipairs(f.rows) do
+        for c = 1, #pat do
+          if pat:sub(c, c) == "#" then
+            local xx, yy = lx0 + c - 1, ly0 + r - 1
+            if xx >= 1 and xx <= 16 and yy >= 1 and yy <= 16 then g[yy][xx] = "w" end
+          end
+        end
+      end
+    end
+  end
+  local cols = { o = shade(base, 0.28), a = base, b = shade(base, 0.62), c = lighten(base, 0.4),
+                 h = 0x8b5a2b, H = 0x5e3a1c, x = accent, w = 0xf4f0ea }
+  local cc = {}
+  local rows = {}
+  for y = 1, 16 do
+    local t = {}
+    for x = 1, 16 do
+      local ch = g[y][x]
+      local idx = bgIdx
+      if ch ~= "." and cols[ch] then
+        idx = cc[ch]
+        if not idx then idx = colorIndex(cols[ch]); cc[ch] = idx end
+      end
+      t[x] = string.char(idx)
+    end
+    rows[y] = table.concat(t)
+  end
+  icache[key] = rows
+  return rows
+end
+
+--------------------------------------------------------------------
 -- data model + persistence
 --------------------------------------------------------------------
-local data = { v = 1, players = {}, chat = {}, heat = {}, dims = {}, saved = 0 }
+local data = { v = 1, players = {}, chat = {}, heat = {}, dims = {}, inv = { dir = {}, chest = {} }, saved = 0 }
 local dirty, chatVer, startup = false, 0, true
 local lastSave, lastTry, lastSaveBytes, nbtOK = 0, 0, 0, true
 local nbtBudget = CONFIG.NBT_BUDGET
@@ -483,6 +760,7 @@ local function jstr(v) return '"' .. (tostring(v):gsub('[\\"]', '\\%0')) .. '"' 
 -- of heatmap samples (it could trip "too long without yielding")
 local function encode(f)
   local parts = { '{"v":1,"saved":', tostring(floor(data.saved or 0)), ',"dims":', textutils.serialiseJSON(data.dims),
+                  ',"inv":', textutils.serialiseJSON(data.inv),
                   ',"players":', textutils.serialiseJSON(data.players), ',"chat":[' }
   local nc, c = #data.chat, {}
   for i = nc - floor(nc * f) + 1, nc do
@@ -605,6 +883,9 @@ local function loadData()
   data.chat = data.chat or {}
   data.heat = data.heat or {}
   data.dims = data.dims or {}
+  data.inv = data.inv or {}
+  data.inv.dir = data.inv.dir or {}
+  data.inv.chest = data.inv.chest or {}
   for _, p in pairs(data.players) do p.online = false end
   -- repair: v2.0/2.1 mis-parsed chat events and stored UUIDs as player names
   local uu = "^%x+%-%x+%-%x+%-%x+%-%x+$"
@@ -722,6 +1003,12 @@ local function writeDebug(name)
   f.writeLine("last touch: " .. diag.touch)
   f.writeLine("nbt: " .. nbtName .. " methods: " .. diag.nbtMethods .. "  error: " .. diag.nbtErr)
   f.writeLine("last chat event: " .. diag.chatRaw)
+  for _, n in ipairs(peripheral.getNames()) do
+    if n:match("^inventory_manager") then
+      local ok, m = pcall(peripheral.getMethods, n)
+      f.writeLine("inventory manager " .. n .. " methods: " .. (ok and table.concat(m, ", ") or "?"))
+    end
+  end
   if name then
     local pos, how, raw = readPos(name)
     f.writeLine("sample player: " .. name)
@@ -781,6 +1068,253 @@ local function poll()
     if p.online and not set[name] then setOffline(name) end
   end
   startup = false
+end
+
+--------------------------------------------------------------------
+-- REMOTE INVENTORY  (Advanced Peripherals Inventory Managers)
+--------------------------------------------------------------------
+-- slot numbers used everywhere below are Minecraft inventory indexes:
+--   0-8 hotbar, 9-35 main, 36 boots, 37 legs, 38 chestplate, 39 helmet, 40 offhand
+local inv = { mgrs = {}, owners = {}, cands = {}, sel = nil, cache = {}, pick = nil,
+              mpage = 0, crow = 0, flash = nil, scanT = 0, methods = {} }
+local DIRS = { "auto", "up", "down", "north", "south", "east", "west", "left", "right", "front", "back" }
+local AUTODIRS = { "up", "down", "north", "south", "east", "west" }
+
+local function natKey(s) return (s:gsub("%d+", function(d) return string.format("%08d", tonumber(d)) end)) end
+
+local function invFlash(msg, ok) inv.flash = { msg = sanitize(msg), ok = ok, t = now() } end
+
+local function norm(it)
+  if type(it) ~= "table" then return nil end
+  local n = it.name
+  if type(n) ~= "string" or n == "" or n == "minecraft:air" then return nil end
+  local c = tonumber(it.count) or 1
+  if c <= 0 then return nil end
+  return { name = n, count = c, disp = it.displayName and sanitize(it.displayName) or nil, slot = tonumber(it.slot) }
+end
+
+local function isInventoryP(n)
+  if n:match("^inventory_manager") then return false end
+  local okt, ti = pcall(function() return { peripheral.getType(n) } end)
+  if okt then
+    for _, t in ipairs(ti) do if t == "inventory_manager" or t == "inventoryManager" then return false end end
+    for _, t in ipairs(ti) do if t == "inventory" then return true end end
+  end
+  local ok, m = pcall(peripheral.getMethods, n)
+  if ok and type(m) == "table" then
+    local a, b = false, false
+    for _, x in ipairs(m) do if x == "list" then a = true elseif x == "size" then b = true end end
+    return a and b
+  end
+  return false
+end
+
+local function invScan()
+  local out, cands = {}, {}
+  for _, n in ipairs(peripheral.getNames()) do
+    local isM = n:match("^inventory_manager") ~= nil
+    if not isM then
+      local ok, ts = pcall(function() return { peripheral.getType(n) } end)
+      if ok then for _, t in ipairs(ts) do if t == "inventory_manager" or t == "inventoryManager" then isM = true end end end
+    end
+    if isM then out[#out + 1] = n
+    elseif isInventoryP(n) then cands[#cands + 1] = n end
+  end
+  table.sort(out, function(a, b) return natKey(a) < natKey(b) end)
+  table.sort(cands, function(a, b) return natKey(a) < natKey(b) end)
+  inv.mgrs, inv.cands = out, cands
+  for _, n in ipairs(out) do
+    local ok, o = pcall(peripheral.call, n, "getOwner")
+    inv.owners[n] = (ok and type(o) == "string" and o ~= "") and o or false
+  end
+end
+
+local function chestFor(mgr)
+  local c = data.inv.chest[mgr]
+  if c and peripheral.isPresent(c) then return c end
+  if #inv.cands == 1 then return inv.cands[1] end
+  return nil
+end
+
+local function mgrMethods(name)
+  local m = inv.methods[name]
+  if m then return m end
+  m = {}
+  local ok, list = pcall(peripheral.getMethods, name)
+  if ok and type(list) == "table" then for _, x in ipairs(list) do m[x] = true end end
+  inv.methods[name] = m
+  return m
+end
+
+local function invLoad()
+  local name = inv.sel
+  if not name then return end
+  local st = inv.cache[name]
+  if not st then st = { slots = {}, held = {} }; inv.cache[name] = st end
+  local ok, o = pcall(peripheral.call, name, "getOwner")
+  st.owner = (ok and type(o) == "string" and o ~= "") and o or nil
+  st.err = nil
+  if not st.owner then
+    st.err = "NO MEMORY CARD IN THIS MANAGER"
+    st.slots, st.held, st.heldInfo = {}, {}, nil
+  else
+    local okI, items = pcall(peripheral.call, name, "getItems")
+    if not okI or type(items) ~= "table" then
+      st.err = "PLAYER NOT REACHABLE: " .. sanitize(tostring(items)):sub(1, 80)
+      st.slots, st.held, st.heldInfo = {}, {}, nil
+    else
+      local slots = {}
+      for _, it in pairs(items) do
+        local n = norm(it)
+        if n then
+          local s = n.slot
+          if s then
+            if s >= 100 and s <= 103 then s = 36 + (s - 100) end
+            slots[s] = n
+          end
+        end
+      end
+      -- armour
+      local okA, arm = pcall(peripheral.call, name, "getArmor")
+      if okA and type(arm) == "table" then
+        for i, it in pairs(arm) do
+          local n = norm(it)
+          if n then
+            local s = n.slot
+            local idx
+            if s then
+              if s >= 100 then idx = s - 100 elseif s >= 36 then idx = s - 36 else idx = s end
+            else
+              idx = (type(i) == "number") and (i - 1) or 0
+            end
+            idx = clamp(idx, 0, 3)
+            if not slots[36 + idx] then slots[36 + idx] = n end
+          end
+        end
+      end
+      -- offhand
+      for _, fname in ipairs({ "getItemInOffHand", "getOffHand" }) do
+        if not slots[40] then
+          local okO, off = pcall(peripheral.call, name, fname)
+          if okO then local n = norm(off); if n then slots[40] = n end end
+        end
+      end
+      -- which hotbar slot is held
+      local held, hinfo, ambig = {}, nil, false
+      local m = mgrMethods(name)
+      local selSlot
+      for _, fname in ipairs({ "getSelectedSlot", "getHeldSlot", "getHandSlot", "getCurrentSlot" }) do
+        if m[fname] and not selSlot then
+          local okS, v = pcall(peripheral.call, name, fname)
+          if okS and type(v) == "number" and v >= 0 and v <= 8 then selSlot = v end
+        end
+      end
+      local okH, hi = pcall(peripheral.call, name, "getItemInHand")
+      local hn = okH and norm(hi) or nil
+      if selSlot then
+        held[selSlot] = true; hinfo = slots[selSlot] or hn
+      elseif hn then
+        local cands = {}
+        for s = 0, 8 do
+          local it = slots[s]
+          if it and it.name == hn.name and it.count == hn.count then cands[#cands + 1] = s end
+        end
+        for _, s in ipairs(cands) do held[s] = true end
+        ambig = #cands > 1
+        hinfo = hn
+      end
+      st.slots, st.held, st.heldInfo, st.heldAmbig, st.when = slots, held, hinfo, ambig, now()
+    end
+  end
+  -- connected chest
+  local cname = chestFor(name)
+  st.cerr = nil
+  if cname then
+    local ok1, l = pcall(peripheral.call, cname, "list")
+    local ok2, sz = pcall(peripheral.call, cname, "size")
+    if ok1 and type(l) == "table" then
+      local ci, hi = {}, 0
+      for s, it in pairs(l) do
+        if type(it) == "table" then ci[s] = { name = it.name, count = it.count or 1 }; hi = max(hi, s) end
+      end
+      st.chest = { name = cname, size = (ok2 and tonumber(sz)) or max(27, hi), items = ci }
+    else
+      st.chest = nil; st.cerr = sanitize(tostring(l)):sub(1, 60)
+    end
+  else
+    st.chest = nil
+  end
+end
+
+local function invRefresh(forceScan)
+  local ok, err = pcall(function()
+    if forceScan or now() - inv.scanT >= 3 or #inv.mgrs == 0 then invScan(); inv.scanT = now() end
+    local has = false
+    for _, n in ipairs(inv.mgrs) do if n == inv.sel then has = true end end
+    if not has then inv.sel = inv.mgrs[1]; inv.pick = nil end
+    invLoad()
+  end)
+  if not ok then logErr("inv: " .. tostring(err)) end
+end
+
+-- moving items -------------------------------------------------------
+local function callMove(mgr, fn, dir, filter)
+  local function try(...)
+    local ok, r, e = pcall(peripheral.call, mgr, fn, ...)
+    if ok then
+      if type(r) == "number" then return r end
+      return 0, tostring(e or r)
+    end
+    return nil, tostring(r)
+  end
+  local n, err = try(dir, filter)                       -- current Advanced Peripherals (filter table)
+  if n == nil and filter.fromSlot then                  -- older versions: (dir, count, slot)
+    n, err = try(dir, filter.count, filter.fromSlot)
+  end
+  return n, err
+end
+
+local function transfer(mgr, fn, filter)
+  local d = data.inv.dir[mgr] or "auto"
+  local dirs = (d == "auto") and AUTODIRS or { d }
+  local lastErr = "no inventory touching the manager on that side?"
+  for _, dir in ipairs(dirs) do
+    local n, err = callMove(mgr, fn, dir, filter)
+    if n and n > 0 then
+      if d == "auto" then data.inv.dir[mgr] = dir; dirty = true end   -- remember what worked
+      return n
+    end
+    if err and err ~= "" then lastErr = err end
+  end
+  return 0, lastErr
+end
+
+local function invItemAt(st, side, slot)
+  if not st then return nil end
+  if side == "p" then return st.slots[slot] end
+  return st.chest and st.chest.items[slot] or nil
+end
+
+local function invMove(mode)
+  local mgr, pk = inv.sel, inv.pick
+  local st = mgr and inv.cache[mgr]
+  if not st or not pk then return end
+  local it = invItemAt(st, pk.side, pk.slot)
+  if not it then inv.pick = nil; return end
+  local cnt = (mode == "one") and 1 or (mode == "half" and max(1, floor(it.count / 2)) or it.count)
+  local n, err
+  if pk.side == "p" then
+    n, err = transfer(mgr, "removeItemFromPlayer", { fromSlot = pk.slot, count = cnt })
+  else
+    n, err = transfer(mgr, "addItemToPlayer", { fromSlot = pk.slot - 1 + CONFIG.AP_SLOT_BASE, count = cnt })
+  end
+  if n > 0 then
+    invFlash("MOVED " .. n .. "x " .. (it.disp or (it.name:gsub("^.-:", ""))), true)
+  else
+    invFlash("FAILED: " .. tostring(err), false)
+  end
+  invRefresh(false)
+  if not invItemAt(inv.cache[mgr], pk.side, pk.slot) then inv.pick = nil end
 end
 
 --------------------------------------------------------------------
@@ -1151,6 +1685,186 @@ local function drawChat()
 end
 
 --------------------------------------------------------------------
+-- INVENTORY TAB
+--------------------------------------------------------------------
+local function pretty(n)
+  local s = tostring(n):gsub("^.-:", ""):gsub("_", " ")
+  return s:upper()
+end
+
+local function drawInv()
+  local lx, rb = M, PXW - M
+  local mg = inv.mgrs
+  text(lx, CY0, "MEMORY CARDS   -   " .. #mg .. " INVENTORY MANAGER" .. (#mg == 1 and "" or "S"), G1, K0)
+  rect(lx, CY0 + 12, rb - lx, 1, K3)
+  if #mg == 0 then
+    ctext(lx, rb - lx, CY0 + 80, "NO INVENTORY MANAGERS FOUND", RD, K0, 1)
+    ctext(lx, rb - lx, CY0 + 98, "connect them with wired modems (inventory_manager_0, _1 ...)", G1, K0, 1)
+    ctext(lx, rb - lx, CY0 + 112, "each one needs a memory card bound to a player", G1, K0, 1)
+    return
+  end
+  if not inv.sel then inv.sel = mg[1] end
+
+  -- manager / memory card strip -------------------------------------
+  local cw, ch, gap, aw = 112, 30, 4, 22
+  local nvis = max(1, floor((rb - lx - 2 * aw - 8) / (cw + gap)))
+  inv.mpage = clamp(inv.mpage, 0, max(0, #mg - nvis))
+  local cy = CY0 + 18
+  local cx0 = lx
+  local arrows = #mg > nvis
+  if arrows then
+    btn("invmpg-", lx, cy, aw, ch, "<", "outline", nil, K0)
+    btn("invmpg+", rb - aw, cy, aw, ch, ">", "outline", nil, K0)
+    cx0 = lx + aw + 4
+  end
+  for i = 1, nvis do
+    local name = mg[inv.mpage + i]
+    if not name then break end
+    local owner = inv.owners[name]
+    local on = (name == inv.sel)
+    local x = cx0 + (i - 1) * (cw + gap)
+    rect(x, cy, cw, ch, on and O4 or K3)
+    rect(x + 1, cy + 1, cw - 2, ch - 2, on and K2 or K1)
+    local short = ((name:gsub("inventory_manager", "MGR")):gsub("_", " ")):upper()
+    text(x + 8, cy + 5, fit(short, cw - 16, 1), on and O5 or G1, on and K2 or K1)
+    local pl = owner and data.players[owner]
+    rect(x + 8, cy + 19, 5, 5, (owner and pl and pl.online) and O4 or K3)
+    text(x + 17, cy + 17, fit(owner or "NO CARD", cw - 26, 1), owner and WH or RD, on and K2 or K1)
+    addHit("invmgr", x, cy, cw, ch, name)
+  end
+
+  local st = inv.cache[inv.sel]
+  local owner = st and st.owner
+
+  -- layout -----------------------------------------------------------
+  local ptitleY = cy + ch + 10
+  local gy = ptitleY + 16
+  local avail = PXW - 2 * M - 34 - 16
+  local p = clamp(min(floor(avail / 18), floor((CY1 - gy - 104) / 6)), 22, 32)
+  local pgx = lx + 34
+  local cgx = pgx + 9 * p + 16
+  local sz = p - 1
+
+  local function slot(x, y, item, side, idx, label)
+    local sel = inv.pick and inv.pick.side == side and inv.pick.slot == idx
+    local held = side == "p" and st and st.held and st.held[idx]
+    local border = sel and O4 or (held and YL or K3)
+    local bw = (sel or held) and 2 or 1
+    local bg = sel and O1 or K1
+    rect(x, y, sz, sz, border)
+    rect(x + bw, y + bw, sz - 2 * bw, sz - 2 * bw, bg)
+    if item then
+      put(x + floor((sz - 16) / 2), y + floor((sz - 16) / 2), itemIcon(item.name, bg))
+      if item.count > 1 then
+        local s = tostring(item.count)
+        text(x + sz - textW(s, 1) - 1, y + sz - 10, s, WH, bg)
+      end
+    elseif label then
+      ctext(x, sz, y + floor((sz - 7) / 2), label, K3, bg)
+    end
+    if held then rect(x + sz - 7, y + 1, 5, 5, YL) end
+    addHit("invslot", x, y, p, p, { side = side, slot = idx })
+  end
+
+  -- player panel -----------------------------------------------------
+  local title = owner and (string.upper(owner) .. "  -  INVENTORY") or "NO PLAYER"
+  text(lx, ptitleY, fit(title, 9 * p + 34, 1), owner and O4 or RD, K0)
+  local S = st and st.slots or {}
+  local armorLab = { [39] = "HD", [38] = "CH", [37] = "LG", [36] = "BT" }
+  local ai = 0
+  for _, idx in ipairs({ 39, 38, 37, 36 }) do
+    slot(lx, gy + ai * p, S[idx], "p", idx, armorLab[idx]); ai = ai + 1
+  end
+  slot(lx, gy + 4 * p, S[40], "p", 40, "OF")
+  for r = 0, 2 do
+    for c = 0, 8 do slot(pgx + c * p, gy + r * p, S[9 + r * 9 + c], "p", 9 + r * 9 + c) end
+  end
+  for c = 0, 8 do
+    local it = S[c]
+    slot(pgx + c * p, gy + 3 * p + 8, it, "p", c, (not it) and tostring(c + 1) or nil)
+  end
+  -- what they are holding
+  if st and st.heldInfo then
+    local hi = st.heldInfo
+    local ht = "HOLDING: " .. string.upper(fit(hi.disp or pretty(hi.name), 190, 1)) .. " x" .. hi.count
+    if st.heldAmbig then ht = ht .. "  (SLOT UNSURE)" end
+    text(pgx, gy + 4 * p + 12, ht, YL, K0)
+  elseif owner and not st.err then
+    text(pgx, gy + 4 * p + 12, "HOLDING: NOTHING", G1, K0)
+  end
+  if st and st.err then
+    local w0 = 9 * p
+    rect(pgx, gy + 1.5 * p, w0, 44, K1)
+    rect(pgx, gy + 1.5 * p, w0, 1, RD)
+    ctext(pgx, w0, gy + 1.5 * p + 8, "UNAVAILABLE", RD, K1)
+    for i, ln in ipairs(wrapPx(st.err, w0 - 16)) do
+      if i > 2 then break end
+      ctext(pgx, w0, gy + 1.5 * p + 18 + (i - 1) * 11, ln, G2, K1)
+    end
+  end
+
+  -- chest panel ------------------------------------------------------
+  local cst = st and st.chest
+  local cname = chestFor(inv.sel)
+  text(cgx, ptitleY, fit("CHEST  -  " .. (cname or "NOT CONNECTED"), 9 * p - 62, 1), cname and O4 or RD, K0)
+  local vr = 3
+  if cst then
+    local totalRows = math.ceil(cst.size / 9)
+    vr = min(totalRows, 6)
+    inv.crow = clamp(inv.crow, 0, max(0, totalRows - vr))
+    if totalRows > vr then
+      btn("invcr-", cgx + 9 * p - 56, ptitleY - 6, 26, 18, "UP", "outline", nil, K0)
+      btn("invcr+", cgx + 9 * p - 28, ptitleY - 6, 26, 18, "DN", "outline", nil, K0)
+    end
+    for r = 0, vr - 1 do
+      for c = 0, 8 do
+        local idx = (inv.crow + r) * 9 + c + 1
+        if idx <= cst.size then slot(cgx + c * p, gy + r * p, cst.items[idx], "c", idx) end
+      end
+    end
+  else
+    local w0, h0 = 9 * p - 1, 3 * p - 1
+    rect(cgx, gy, w0, h0, K3)
+    rect(cgx + 1, gy + 1, w0 - 2, h0 - 2, K1)
+    ctext(cgx, w0, gy + 18, cname and "CHEST UNREADABLE" or "NO CHEST PERIPHERAL", RD, K1)
+    ctext(cgx, w0, gy + 32, cst == nil and st and st.cerr or "tap CHEST below to choose one", G1, K1)
+    ctext(cgx, w0, gy + 48, "sending player -> chest still works", G1, K1)
+  end
+
+  -- action bar -------------------------------------------------------
+  local py = gy + max(5 * p, vr * p) + 12
+  rect(lx, py - 6, rb - lx, 1, K3)
+  local pk = inv.pick
+  local it = pk and invItemAt(st, pk.side, pk.slot)
+  if pk and not it then inv.pick = nil; pk = nil end
+  if it then
+    rect(lx, py, 20, 20, K1)
+    put(lx + 2, py + 2, itemIcon(it.name, K1))
+    local nm = string.upper(it.disp or pretty(it.name))
+    text(lx + 28, py, fit(nm .. "  x" .. it.count, 280, 1), WH, K0)
+    local where = (pk.side == "p") and ("PLAYER SLOT " .. pk.slot) or ("CHEST SLOT " .. pk.slot)
+    text(lx + 28, py + 11, fit(where .. "   " .. it.name, 280, 1), G1, K0)
+    local bx = lx + 330
+    text(bx, py + 1, pk.side == "p" and "SEND TO CHEST" or "TAKE TO PLAYER", O5, K0)
+    btn("invmove", bx, py + 14, 56, 26, "ONE", "solid", "one", K0)
+    btn("invmove", bx + 62, py + 14, 62, 26, "HALF", "solid", "half", K0)
+    btn("invmove", bx + 130, py + 14, 56, 26, "ALL", "solid", "all", K0)
+    btn("invdesel", bx + 192, py + 14, 96, 26, "DESELECT", "outline", nil, K0)
+  else
+    text(lx, py + 2, "TAP A SLOT TO SELECT IT, THEN CHOOSE HOW MANY TO MOVE", G1, K0)
+    text(lx, py + 14, "PLAYER ITEMS GO INTO THE CHEST - CHEST ITEMS GO BACK TO THE PLAYER", K3, K0)
+  end
+  local sy = py + 46
+  btn("invdir", lx, sy, 130, 26, "DIR: " .. string.upper(data.inv.dir[inv.sel] or "auto"), "outline", nil, K0)
+  btn("invchest", lx + 136, sy, 210, 26, "CHEST: " .. (data.inv.chest[inv.sel] or (cname and "AUTO") or "PICK"), "outline", nil, K0)
+  btn("invrefresh", lx + 352, sy, 100, 26, "REFRESH", "outline", nil, K0)
+  local fl = inv.flash
+  if fl and now() - fl.t < 8 then
+    text(lx, sy + 32, fit(fl.msg, rb - lx, 1), fl.ok and O5 or RD, K0)
+  end
+end
+
+--------------------------------------------------------------------
 -- HEATMAP TAB
 --------------------------------------------------------------------
 local function heatPlayers()
@@ -1470,6 +2184,8 @@ local function drawSystem()
   end
   line("NBT STORAGE", nbtLine, (nbt and not nbtOK) and RD or WH)
   if nbt then line("NBT METHODS", nbtName .. ": " .. diag.nbtMethods, G2) end
+  line("INVENTORY", #inv.mgrs .. " manager(s), " .. #inv.cands .. " chest-like peripheral(s) found",
+       #inv.mgrs > 0 and WH or G1)
   line("DISK COPY", diag.localBytes .. " bytes   " .. #data.chat .. " chat entries" ..
        (diag.saveErr ~= "" and ("   ERROR " .. diag.saveErr) or ""), diag.saveErr ~= "" and RD or WH)
   line("LAST TOUCH", diag.touch, WH)
@@ -1616,6 +2332,7 @@ end
 -- APP FRAME
 --------------------------------------------------------------------
 local TABS = { { id = "tracking", label = "TRACKING" }, { id = "chat", label = "CHAT LOG" },
+               { id = "inv", label = "INVENTORY" },
                { id = "heat", label = "HEATMAP" }, { id = "sys", label = "SYSTEM" } }
 
 local function lockRemaining()
@@ -1628,14 +2345,14 @@ local function drawHeader()
   rect(0, 0, PXW, 2, O4)
   text(M + 2, 8, "NEXUS", O4, K0, 2)
   text(M + 2 + textW("NEXUS", 2) + 8, 17, "TRACKER", G1, K0)
-  local tx = M + 2 + textW("NEXUS", 2) + 8 + textW("TRACKER", 1) + 24
+  local tx = M + 2 + textW("NEXUS", 2) + 8 + textW("TRACKER", 1) + 20
   for _, t in ipairs(TABS) do
     local active = ui.tab == t.id
     local tw = textW(t.label, 1)
-    text(tx + 14, 13, t.label, active and O4 or G1, K0)
-    if active then rect(tx + 8, 28, tw + 12, 2, O4) end
-    addHit("tab", tx, 4, tw + 28, HDR - 4, t.id)
-    tx = tx + tw + 32
+    text(tx + 8, 13, t.label, active and O4 or G1, K0)
+    if active then rect(tx + 2, 28, tw + 12, 2, O4) end
+    addHit("tab", tx, 4, tw + 20, HDR - 4, t.id)
+    tx = tx + tw + 22
   end
   rect(0, HDR, PXW, 1, K3)
 
@@ -1645,11 +2362,11 @@ local function drawHeader()
   local bx = PXW - M - 40 - textW("00:00", 1) - 20
   if ui.tab == "chat" then
     local n = activeFilterCount()
-    local w = 92
+    local w = 84
     local style = (n > 0 or ui.drawer == "filter") and "solid" or "outline"
     btn("filterbtn", bx - w, 7, w, 22, n > 0 and ("FILTER " .. n) or "FILTER", style, nil, K0)
   elseif ui.tab == "heat" then
-    local w = 92
+    local w = 84
     btn("menubtn", bx - w, 7, w, 22, "MENU", ui.drawer == "heat" and "solid" or "outline", nil, K0)
   end
 end
@@ -1684,6 +2401,7 @@ local function drawApp()
   drawHeader()
   if ui.tab == "tracking" then drawTracking()
   elseif ui.tab == "chat" then drawChat()
+  elseif ui.tab == "inv" then drawInv()
   elseif ui.tab == "sys" then drawSystem()
   else drawHeat() end
   if ui.drawer == "filter" and ui.tab == "chat" then drawFilterDrawer()
@@ -1720,7 +2438,7 @@ end
 --------------------------------------------------------------------
 local function lock()
   ui.locked = true; ui.pin = ""; ui.msg = ""; ui.modal = nil; ui.drawer = nil
-  hm.playing = false
+  hm.playing = false; inv.pick = nil
 end
 local function cycle(v, n) return (v % n) + 1 end
 
@@ -1740,6 +2458,28 @@ local function openHeatPicker()
     isSel = function(n) return hm.player == n end,
     pick = function(n)
       hm.player = n; hm.tp = nil; hm.follow = true; hm.dim = nil; hm.playing = false
+    end,
+  }
+end
+local function openChestPicker()
+  local mgr = inv.sel
+  if not mgr then return end
+  ui.modal = {
+    type = "picker", title = "SELECT CHEST PERIPHERAL FOR " .. string.upper(mgr), page = 1, single = true,
+    items = function()
+      local a = { "(AUTO)" }
+      for _, n in ipairs(inv.cands) do a[#a + 1] = n end
+      return a
+    end,
+    isSel = function(n)
+      local c = data.inv.chest[mgr]
+      if n == "(AUTO)" then return c == nil end
+      return c == n
+    end,
+    pick = function(n)
+      data.inv.chest[mgr] = (n ~= "(AUTO)") and n or nil
+      dirty = true; inv.crow = 0; inv.pick = nil
+      invRefresh(false)
     end,
   }
 end
@@ -1798,7 +2538,9 @@ local function handleHit(h, tx, ty)
   end
 
   -- header / drawers
-  if id == "tab" then ui.tab = d; ui.drawer = nil
+  if id == "tab" then
+    ui.tab = d; ui.drawer = nil
+    if d == "inv" then invRefresh(true) end
   elseif id == "lock" then lock()
   elseif id == "filterbtn" then ui.drawer = (ui.drawer == "filter") and nil or "filter"
   elseif id == "menubtn" then ui.drawer = (ui.drawer == "heat") and nil or "heat"
@@ -1807,6 +2549,33 @@ local function handleHit(h, tx, ty)
   -- system
   elseif id == "syssave" then saveNow()
   elseif id == "sysdebug" then writeDebug(next(data.players))
+
+  -- inventory
+  elseif id == "invmgr" then
+    inv.sel = d; inv.pick = nil; inv.crow = 0; invRefresh(false)
+  elseif id == "invslot" then
+    local st = inv.sel and inv.cache[inv.sel]
+    local it = invItemAt(st, d.side, d.slot)
+    if not it then inv.pick = nil
+    elseif inv.pick and inv.pick.side == d.side and inv.pick.slot == d.slot then inv.pick = nil
+    else inv.pick = { side = d.side, slot = d.slot } end
+  elseif id == "invdesel" then inv.pick = nil
+  elseif id == "invmove" then invMove(d)
+  elseif id == "invdir" then
+    if inv.sel then
+      local cur = data.inv.dir[inv.sel] or "auto"
+      local ci = 1
+      for i, v in ipairs(DIRS) do if v == cur then ci = i end end
+      local nx = DIRS[(ci % #DIRS) + 1]
+      data.inv.dir[inv.sel] = (nx ~= "auto") and nx or nil
+      dirty = true
+    end
+  elseif id == "invchest" then openChestPicker()
+  elseif id == "invrefresh" then invRefresh(true)
+  elseif id == "invmpg-" then inv.mpage = max(0, inv.mpage - 1)
+  elseif id == "invmpg+" then inv.mpage = inv.mpage + 1
+  elseif id == "invcr-" then inv.crow = max(0, inv.crow - 1)
+  elseif id == "invcr+" then inv.crow = inv.crow + 1
 
   -- tracking
   elseif id == "trkrow" then trk.sel = (trk.sel == d) and nil or d
@@ -2034,6 +2803,9 @@ local function main()
         if dirty and now() - lastTry >= CONFIG.SAVE_EVERY then saveNow() end
         if polled and not ui.modal and not (ui.tab == "heat" and hm.playing) then redraw = true end
         if not polled and ui.tab == "sys" and not ui.locked and not ui.modal then redraw = true end
+        if ui.tab == "inv" and not ui.locked and not ui.modal and tick % CONFIG.INV_POLL == 0 then
+          invRefresh(false); redraw = true
+        end
       elseif ev[2] == frameT then
         frameT = nil
         frame()
