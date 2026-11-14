@@ -1,0 +1,24 @@
+local m = peripheral.wrap("inventory_manager_0")
+local f = fs.open("probe_out.txt", "w")
+local function out(...)
+  local t = {}
+  for i = 1, select("#", ...) do t[i] = tostring((select(i, ...))) end
+  f.writeLine(table.concat(t, " "))
+end
+local chest
+for _, n in ipairs(peripheral.getNames()) do
+  if not n:find("inventory_manager") and peripheral.hasType(n, "inventory") then chest = n end
+end
+out("chest", chest)
+local keys = {}
+for k, v in pairs(m.list()) do
+  keys[#keys + 1] = tostring(k) .. "=" .. tostring(v.name) .. "x" .. tostring(v.count)
+end
+table.sort(keys)
+out("list", #keys, table.concat(keys, " "))
+out("hand", m.getHandSlot())
+out("imp", pcall(m.importItem, chest, 999))
+out("exp", pcall(m.exportItem, chest, 999))
+out("imp4", pcall(m.importItem, chest, 999, 1, 1))
+out("exp4", pcall(m.exportItem, chest, 999, 1, 1))
+f.close()
