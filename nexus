@@ -1,5 +1,5 @@
 --=====================================================================
---  NEXUS TRACKER  v2.6   -  black & orange pixel UI
+--  NEXUS TRACKER  v2.7   -  black & orange pixel UI
 --  CC:Tweaked + Advanced Peripherals + CC: Graphics  (NeoForge 1.21.1)
 --
 --  Needs: Advanced Monitor (6x3), Chat Box, Player Detector, NBT Storage
@@ -1128,6 +1128,15 @@ local function isInventoryP(n)
   return false
 end
 
+-- new Advanced Peripherals returns (uuid, username) from getOwner, old ones just the username
+local function ownerOf(name)
+  local ok, a, b = pcall(peripheral.call, name, "getOwner")
+  if not ok then return nil end
+  local o = (type(b) == "string" and b ~= "") and b or a
+  if type(o) == "string" and o ~= "" then return o end
+  return nil
+end
+
 local function invScan()
   local out, cands = {}, {}
   for _, n in ipairs(peripheral.getNames()) do
@@ -1143,8 +1152,7 @@ local function invScan()
   table.sort(cands, function(a, b) return natKey(a) < natKey(b) end)
   inv.mgrs, inv.cands = out, cands
   for _, n in ipairs(out) do
-    local ok, o = pcall(peripheral.call, n, "getOwner")
-    inv.owners[n] = (ok and type(o) == "string" and o ~= "") and o or false
+    inv.owners[n] = ownerOf(n) or false
   end
 end
 
@@ -1170,23 +1178,32 @@ local function invLoad()
   if not name then return end
   local st = inv.cache[name]
   if not st then st = { slots = {}, held = {} }; inv.cache[name] = st end
-  local ok, o = pcall(peripheral.call, name, "getOwner")
-  st.owner = (ok and type(o) == "string" and o ~= "") and o or nil
+  st.owner = ownerOf(name)
   st.err = nil
   if not st.owner then
-    st.err = "NO MEMORY CARD IN THIS MANAGER"
+    st.err = "NO MEMORY CARD (OR OWNER OFFLINE)"
     st.slots, st.held, st.heldInfo = {}, {}, nil
   else
-    local okI, items = pcall(peripheral.call, name, "getItems")
+    local mm = mgrMethods(name)
+    local fnItems = (mm.getItems and "getItems") or (mm.list and "list") or "getItems"
+    local okI, items = pcall(peripheral.call, name, fnItems)
     if not okI or type(items) ~= "table" then
       st.err = "PLAYER NOT REACHABLE: " .. sanitize(tostring(items)):sub(1, 80)
       st.slots, st.held, st.heldInfo = {}, {}, nil
     else
       local slots = {}
-      for _, it in pairs(items) do
+      -- list() is a CC-style map keyed by slot, 1-based unless a slot 0 shows up
+      local base = 0
+      if fnItems == "list" then
+        base = 1
+        for k in pairs(items) do if k == 0 then base = 0 end end
+      end
+      st.base = base
+      for k, it in pairs(items) do
         local n = norm(it)
         if n then
           local s = n.slot
+          if s == nil and type(k) == "number" then s = k - base end
           if s then
             if s >= 100 and s <= 103 then s = 36 + (s - 100) end
             slots[s] = n
@@ -1221,15 +1238,24 @@ local function invLoad()
       -- which hotbar slot is held
       local held, hinfo, ambig = {}, nil, false
       local m = mgrMethods(name)
-      local selSlot
+      local selSlot, rawSel
       for _, fname in ipairs({ "getSelectedSlot", "getHeldSlot", "getHandSlot", "getCurrentSlot" }) do
         if m[fname] and not selSlot then
           local okS, v = pcall(peripheral.call, name, fname)
-          if okS and type(v) == "number" and v >= 0 and v <= 8 then selSlot = v end
+          if okS and type(v) == "number" and v >= 0 and v <= 9 then rawSel = v end
         end
       end
       local okH, hi = pcall(peripheral.call, name, "getItemInHand")
       local hn = okH and norm(hi) or nil
+      if rawSel then
+        -- may be 0- or 1-based depending on version: prefer whichever matches the held item
+        local c1, c2 = rawSel, rawSel - 1
+        if base == 1 then c1, c2 = rawSel - 1, rawSel end
+        for _, c in ipairs({ c1, c2 }) do
+          if not selSlot and c >= 0 and c <= 8 and hn and slots[c] and slots[c].name == hn.name then selSlot = c end
+        end
+        if not selSlot and c1 >= 0 and c1 <= 8 then selSlot = c1 end
+      end
       if selSlot then
         held[selSlot] = true; hinfo = slots[selSlot] or hn
       elseif hn then
@@ -1278,29 +1304,39 @@ end
 
 -- moving items -------------------------------------------------------
 local function callMove(mgr, fn, dir, filter)
-  local function try(...)
-    local ok, r, e = pcall(peripheral.call, mgr, fn, ...)
+  local mm = mgrMethods(mgr)
+  local function try(f, ...)
+    local ok, r, e = pcall(peripheral.call, mgr, f, ...)
     if ok then
       if type(r) == "number" then return r end
       return 0, tostring(e or r)
     end
     return nil, tostring(r)
   end
-  local n, err = try(dir, filter)                       -- current Advanced Peripherals (filter table)
+  if mm.pushItems and not mm[fn] then                   -- newer Advanced Peripherals
+    local f = (fn == "removeItemFromPlayer") and "pushItems" or "pullItems"
+    local target = dir
+    if not tostring(dir):find("^@") and not peripheral.isPresent(dir) then target = "@" .. dir end
+    return try(f, target, { fromSlot = filter.fromSlot, count = filter.count })
+  end
+  local n, err = try(fn, dir, filter)                   -- Advanced Peripherals 0.7.x (filter table)
   if n == nil and filter.fromSlot then                  -- older versions: (dir, count, slot)
-    n, err = try(dir, filter.count, filter.fromSlot)
+    n, err = try(fn, dir, filter.count, filter.fromSlot)
   end
   return n, err
 end
 
 local function transfer(mgr, fn, filter)
   local d = data.inv.dir[mgr] or "auto"
-  local dirs = (d == "auto") and AUTODIRS or { d }
+  local dirs = {}
+  for _, v in ipairs((d == "auto") and AUTODIRS or { d }) do dirs[#dirs + 1] = v end
+  local cn = chestFor(mgr)
+  if cn then dirs[#dirs + 1] = cn end            -- newer versions can also move by peripheral name
   local lastErr = "no inventory touching the manager on that side?"
   for _, dir in ipairs(dirs) do
     local n, err = callMove(mgr, fn, dir, filter)
     if n and n > 0 then
-      if d == "auto" then data.inv.dir[mgr] = dir; dirty = true end   -- remember what worked
+      if d == "auto" and dir ~= cn then data.inv.dir[mgr] = dir; dirty = true end   -- remember what worked
       return n
     end
     if err and err ~= "" then lastErr = err end
@@ -1323,9 +1359,10 @@ function invMove(mode)
   local cnt = (mode == "one") and 1 or (mode == "half" and max(1, floor(it.count / 2)) or it.count)
   local n, err
   if pk.side == "p" then
-    n, err = transfer(mgr, "removeItemFromPlayer", { fromSlot = pk.slot, count = cnt })
+    n, err = transfer(mgr, "removeItemFromPlayer", { fromSlot = pk.slot + (st.base or 0), count = cnt })
   else
-    n, err = transfer(mgr, "addItemToPlayer", { fromSlot = pk.slot - 1 + CONFIG.AP_SLOT_BASE, count = cnt })
+    local cb = (st.base == 1) and 1 or CONFIG.AP_SLOT_BASE   -- new API: chest slots are 1-based
+    n, err = transfer(mgr, "addItemToPlayer", { fromSlot = pk.slot - 1 + cb, count = cnt })
   end
   if n > 0 then
     invFlash("MOVED " .. n .. "x " .. (it.disp or (it.name:gsub("^.-:", ""))), true)
